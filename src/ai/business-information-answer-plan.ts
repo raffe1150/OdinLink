@@ -1207,7 +1207,7 @@ export async function buildEvidenceFirstAnswer(input: {
   // detailed wrapper); the record is content-free observability and is emitted
   // exactly once: on the existing denial event, or as SOURCE_COVERAGE_ACCEPTED.
   const sourceDetail = isSourceExhaustiveProtocol(verificationProtocol)
-    ? assessSourceCoverageDetailed(parsed, facets, proposed.units, availableEvidence, input.businessId, verificationProtocol) : undefined;
+    ? assessSourceCoverageDetailed(parsed, facets, proposed.units, availableEvidence, input.businessId, verificationProtocol, input.question) : undefined;
   const sourceAssessment = sourceDetail?.assessment;
   if (sourceAssessment?.state === 'DENIED' ||
     ((ownerProposalIndex !== undefined || repairedOversizedEmpty) && sourceAssessment?.state !== 'COMPLETE')) {

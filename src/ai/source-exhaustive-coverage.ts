@@ -1,4 +1,5 @@
 import type { AnswerUnit, Evidence, Facet } from './business-information-answer-plan';
+import { resolveEvidenceQuote } from './knowledge-citation';
 
 export const SOURCE_EXHAUSTIVE_PROTOCOL = 'source-exhaustive-v1' as const;
 export const SOURCE_EXHAUSTIVE_SCHEMA_NAME = 'odinlink_knowledge_source_exhaustive_v1';
@@ -11,11 +12,20 @@ export function isSourceExhaustiveProtocol(value: unknown): value is SourceExhau
 const requestPlanAlignment = 'Request-plan alignment only: the supplied facets and typed obligations faithfully represent the FULL original question, including actor, attribute, modality, scope and conditions. Not factual answer completeness, source availability, or alignment to a narrower source-scoped question. An unavailable but faithfully represented obligation may be aligned and must remain UNRESOLVED.';
 const typedUnavailableState = 'Select by the ORIGINAL obligation.questionType, not by the descriptive modality of proposed facts. When requested information is unavailable: description -> REQUESTED_INFORMATION_NOT_VERIFIED; requirement -> UNRESOLVED_REQUIREMENT. These states are not interchangeable. An unresolved requirement means the mandatory rule is unknown, never that no rule exists. Other modalities cannot use either state to gain scoped publication; use UNLOCATED when no supported classification applies. Available omitted facts -> AVAILABLE_SOURCE_FACT_OMITTED; lost conditions -> MISSING_CONDITION. COMPLETE still requires genuinely complete coverage.';
 const legacyCompleteness = 'Facet-level answer completeness: false whenever any original obligation in this facet is UNRESOLVED, even if every source-available material fact is preserved. True requires all original obligations fully answered and all material facts preserved.';
-const availableCompleteness = 'Source-available material fact completeness only: true only if all relevant available material facts and their conditions are preserved in entailed unit texts. Unavailable requested information does not by itself make this false.';
+const availableCompleteness = 'True when all relevant available material facts and their conditions are preserved in entailed units. Unrequested optional context that cannot affect the answer is not material. Unavailable requested information does not by itself make this false.';
+const independentOmission = 'INDEPENDENT_REQUESTED_FACT_OMITTED' as const;
+const omissionKinds = ['INDEPENDENT', 'LINKED', 'UNKNOWN'] as const;
+const omissionLimits = { records: 6, id: 32, aspect: 90, quote: 600, units: 6 } as const;
+const boundedText = (text: unknown, max: number, min = 1): text is string =>
+  typeof text === 'string' && text === text.trim() && text.length >= min && text.length <= max;
+const assessmentKeys = ['protocol', 'requestAligned', 'availableMaterialFactsComplete', 'conditionsPreserved', 'conflictsAbsent',
+  'evidenceIdsReviewed', 'acceptedUnitIdsReviewed', 'obligations'];
+const independentOmissionGuidance = `Return sourceCoverage.omissions as {complete,records}. For complete available-source coverage use complete=true and records=[]. Otherwise record each distinct material omission, at most six, and set complete=true only after locating every one. Copy its original obligationId, exact requestedAspect from the customer's question, evidenceId, and exact contiguous source quote. A required qualifier, exception, related procedure step, or anything that changes a retained fact's meaning, conditions, scope, quantity, modality or safety is LINKED. List all affected retained unit IDs. If a dependency or the complete omission inventory is uncertain, use UNKNOWN or complete=false; never guess. Use INDEPENDENT with an empty affectedUnitIds list only when every retained proposition stands on its own in the full source context. If the missing source span cannot be located, leave it out of records and return complete=false.
+Use ${independentOmission} only for an unanswered standalone descriptive obligation or a distinct unanswered clause of a single descriptive obligation. For a compound question, copy the entire omitted interrogative clause and record every omitted fact for that clause. Certify that the retained units fully answer every other requested aspect. Do not classify a missing part of the same procedure or policy as a separate question. Keep the legacy row UNRESOLVED with MISSING_RELEVANT_FACT, no obligation unit IDs, and list any independently answered sibling units under materialUnitIds. Every other facet must be a certified independent omission or fully COMPLETE, with all its units in both legacy coverage arrays. Set availableMaterialFactsComplete=false. Use AVAILABLE_SOURCE_FACT_OMITTED for shared or uncertain omissions and MISSING_CONDITION for omitted conditions. Unrequested context that cannot affect the answer does not make either completeness flag false.`;
 export const SOURCE_EXHAUSTIVE_V2_EVIDENCE_REVIEW = `Review every supplied evidence item for distinct facts that directly answer or materially qualify the requested offering or decision. A catalog and a description of one offering do not exhaust other sources. For example, a source that says some services are available remotely can materially qualify the range of options even when it does not identify which services. Preserve that general availability as a separately cited proposition where relevant. Keep its original scope and conditions. Do not infer named service mappings, suitability, or intake requirements. Exclude independent logistics unless the question requests them or they are necessary to interpret a relevant fact. For a requested procedure, inventory each distinct material step or condition in the source, including steps performed by the business that directly explain how the requested outcome is handled. Preserve the actor and modality of each step; a business procedure does not impose a customer requirement. Before returning proposals, compare that inventory with the actual unit texts so one supported step does not stand in for another. Items to bring: when the question asks whether or what to bring for a visit, each item the source explicitly says the customer must, should or may bring for that visit is material; give each its own unit with its source modality and conditions. A permitted item is relevant, but it is not a recommendation or requirement, and listed items never establish that nothing else is required. Silence, rules about other conduct and accompanying people are not items to bring.`;
 export const SOURCE_COVERAGE_STATES = ['COMPLETE', 'AVAILABLE_SOURCE_FACT_OMITTED', 'REQUESTED_INFORMATION_NOT_VERIFIED',
-  'MISSING_CONDITION', 'UNRESOLVED_REQUIREMENT', 'UNLOCATED'] as const;
-export type SourceShortfall = Readonly<{ facetId: string; obligationId: string; state: typeof SOURCE_COVERAGE_STATES[number] }>;
+  'MISSING_CONDITION', 'UNRESOLVED_REQUIREMENT', 'UNLOCATED', independentOmission] as const;
+export type SourceShortfall = Readonly<{ facetId: string; obligationId: string; state: typeof SOURCE_COVERAGE_STATES[number]; requestedAspect?: string }>;
 export type SourceCoverageAssessment = Readonly<{ state: 'COMPLETE' | 'SCOPED_PARTIAL' | 'DENIED'; unavailable: readonly SourceShortfall[] }>;
 const denied: SourceCoverageAssessment = Object.freeze({ state: 'DENIED', unavailable: Object.freeze([]) });
 const object = (v: any) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -29,17 +39,25 @@ const keys = (v: any, expected: string[]) => object(v) && same(Object.keys(v), e
 export function sourceExhaustiveSchema(base: any, protocol: SourceExhaustiveProtocol = SOURCE_EXHAUSTIVE_PROTOCOL) {
   const str = { type: 'string' }, bool = { type: 'boolean' };
   const alignment = protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL ? { ...bool, description: requestPlanAlignment } : bool;
-  const assessment = { type: 'object', additionalProperties: false, properties: {
+  const bounded = (maxLength: number, minLength = 1) => ({ type: 'string', minLength, maxLength });
+  const strict = (properties: Record<string, unknown>) => ({ type: 'object', additionalProperties: false, properties, required: Object.keys(properties) });
+  const omissions = strict({ complete: bool, records: { type: 'array', maxItems: omissionLimits.records, items: strict({
+    obligationId: bounded(omissionLimits.id), requestedAspect: bounded(omissionLimits.aspect, 8),
+    evidenceId: bounded(omissionLimits.id), exactQuote: bounded(omissionLimits.quote),
+    classification: { type: 'string', enum: omissionKinds },
+    affectedUnitIds: { type: 'array', maxItems: omissionLimits.units, items: bounded(omissionLimits.id) },
+  }) } });
+  const assessment = strict({
     protocol: { type: 'string', enum: [protocol] }, requestAligned: alignment,
     availableMaterialFactsComplete: protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL ? { ...bool, description: availableCompleteness } : bool, conditionsPreserved: bool, conflictsAbsent: bool,
     evidenceIdsReviewed: { type: 'array', items: str, minItems: 1, maxItems: 6 },
     acceptedUnitIdsReviewed: { type: 'array', items: str, minItems: 1, maxItems: 6 },
     obligations: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'object', additionalProperties: false,
-      properties: { facetId: str, obligationId: str, state: { type: 'string', enum: [...SOURCE_COVERAGE_STATES],
-        ...(protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL ? { description: typedUnavailableState } : {}) } },
+      properties: { facetId: str, obligationId: str, state: { type: 'string', enum: SOURCE_COVERAGE_STATES.filter(state => state !== independentOmission || protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL),
+        ...(protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL ? { description: `${typedUnavailableState} ${independentOmission}: an unanswered descriptive aspect with independently verified omission records.` } : {}) } },
       required: ['facetId', 'obligationId', 'state'] } },
-  }, required: ['protocol', 'requestAligned', 'availableMaterialFactsComplete', 'conditionsPreserved', 'conflictsAbsent',
-    'evidenceIdsReviewed', 'acceptedUnitIdsReviewed', 'obligations'] };
+    ...(protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL ? { omissions } : {}),
+  });
   const coverage = protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL ? { ...base.properties.coverage,
     items: { ...base.properties.coverage.items, properties: { ...base.properties.coverage.items.properties, requestAligned: alignment,
       materialFactsComplete: { ...bool, description: legacyCompleteness } } } }
@@ -64,7 +82,8 @@ The supplied unit texts are factual proposals, not the complete rendered respons
 Cross-check the reason for incomplete coverage across both blocks. coverage[].materialFactsComplete and sourceCoverage.availableMaterialFactsComplete have distinct meanings. Legacy flag: ${legacyCompleteness} Independent certificate: ${availableCompleteness}
 ${SOURCE_EXHAUSTIVE_V2_EVIDENCE_REVIEW}
 For each facet, cross-check all original obligation IDs before choosing its legacy flag. Judge unit rejection separately from source omission. A rejected unit is not itself proof of a missing material source fact. Use AVAILABLE_SOURCE_FACT_OMITTED and set availableMaterialFactsComplete=false only when you can identify a distinct source-supported proposition material to the original obligation that is absent from the accepted texts. This can include a rejected unit only if the correctly scoped source proposition is independently established as material and missing. If you cannot determine the shortfall, use UNLOCATED. Never use an unavailable-information state to hide a rejected proposal or a known omission. If only requested information is unavailable and every available material fact is present, use legacy UNRESOLVED and the matching typed unavailable state. An unavailable sibling never excuses an omitted available fact. In a compound obligation, judge each requested aspect before selecting its state. An available general description does not establish a specific service's suitability or the information a business requires to assess it.
-Typed sourceCoverage.obligations state contract: ${typedUnavailableState} Look up each unchanged obligationId in the supplied facets[].obligations and retain its questionType. Exhaustively verified descriptive facts can coexist with an unresolved mandatory requirement: they do not change its type. For an unavailable requirement, preserve legacy status UNRESOLVED with no supporting rule unitIds and certify UNRESOLVED_REQUIREMENT. Never use a descriptive unavailable state merely because all accepted facts have descriptive modality. The backend independently validates the original obligation modality against the returned state and rejects a mismatch without reclassification.`;
+Typed sourceCoverage.obligations state contract: ${typedUnavailableState} Look up each unchanged obligationId in the supplied facets[].obligations and retain its questionType. Exhaustively verified descriptive facts can coexist with an unresolved mandatory requirement: they do not change its type. For an unavailable requirement, preserve legacy status UNRESOLVED with no supporting rule unitIds and certify UNRESOLVED_REQUIREMENT. Never use a descriptive unavailable state merely because all accepted facts have descriptive modality. The backend independently validates the original obligation modality against the returned state and rejects a mismatch without reclassification.
+For a proved independent omission, use the following narrowly scoped exception to whole-answer completeness. ${independentOmissionGuidance}`;
 
 export function sourceExhaustiveInstruction(protocol: SourceExhaustiveProtocol): string {
   return protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL ? SOURCE_EXHAUSTIVE_V2_INSTRUCTION : SOURCE_EXHAUSTIVE_INSTRUCTION;
@@ -80,27 +99,112 @@ export function sourceExhaustiveInstruction(protocol: SourceExhaustiveProtocol):
  *   citing it as coverage of the unresolved requirement and GUARD_10 forbids a
  *   permitted/recommended fact from completing one, so optional-item evidence
  *   can never establish that something is, or is not, required.
- * Negated facts and prohibitions beside any gap, and any non-descriptive fact
- * beside an unverified description, stay blocked (whole-turn denial).
+ * - in a compound descriptive facet, an affirmative recommendation may stand
+ *   beside a distinct, source-bound omission certified independent of all units.
+ * Negated non-descriptive facts and prohibitions beside a gap stay blocked.
  * Validated against the independent Phase 2 corpus (incl. recorded rep-04). */
-export function scopedPartialModalityBlocked(units: readonly AnswerUnit[], unavailable: readonly Pick<SourceShortfall, 'facetId' | 'state'>[]): boolean {
+export function scopedPartialModalityBlocked(units: readonly AnswerUnit[], unavailable: readonly Pick<SourceShortfall, 'facetId' | 'state' | 'requestedAspect'>[]): boolean {
   if (!unavailable.length) return false;
   const gaps = new Map<string, Set<string>>();
   for (const gap of unavailable) gaps.set(gap.facetId, (gaps.get(gap.facetId) ?? new Set()).add(gap.state));
+  const boundOmissions = new Set(unavailable.filter(gap => gap.state === independentOmission && gap.requestedAspect).map(gap => gap.facetId));
   return units.some(u => {
     if (u.modality === 'descriptive') return false;
     const unresolved = u.facetIds.filter(id => gaps.has(id));
     if (!unresolved.length) return false;
+    // The compound request still has an unanswered part. Only affirmative
+    // recommendations may share that facet with a source-bound independent gap.
+    if (u.modality === 'recommended' && u.negation === false &&
+        unresolved.every(id => boundOmissions.has(id) && gaps.get(id)?.size === 1)) return false;
     return !((u.modality === 'permitted' || u.modality === 'recommended' || u.modality === 'required') && u.negation === false &&
       unresolved.every(id => [...gaps.get(id)!].every(state => state === 'UNRESOLVED_REQUIREMENT')));
   });
+}
+
+export function sourceCoverageShapeValid(value: any, protocol: SourceExhaustiveProtocol): boolean {
+  // Older complete or unavailable-only certificates have no material omission records.
+  const extended = protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL && object(value) && Object.hasOwn(value, 'omissions');
+  return keys(value, extended ? [...assessmentKeys, 'omissions'] : assessmentKeys);
+}
+
+// A compound omission must identify a whole interrogative, with a separate
+// interrogative still present in the original obligation. Entailment and the
+// verifier's dependency assessment remain mandatory.
+function standaloneCompoundAspect(description: string, aspect: string): boolean {
+  const clauses = description.split(/(?<=[.!?؟])\s+|\s+(?:and|och|und|y|و)\s+/iu);
+  const interrogative = /^(?:¿?(?:how|what|where|when|who|which|hur|vad|var|när|vem|vilken|vilket|vilka|wie|was|wo|wann|wer|welche[rs]?|cómo|qué|dónde|cuándo|quién|cuál)\s|(?:کجا|چگونه|چه|چقدر|کی|هل|أين|كيف|متى|ما|كم)\s)/iu;
+  return clauses.includes(aspect) && interrogative.test(aspect) &&
+    clauses.some(clause => clause !== aspect && interrogative.test(clause));
+}
+
+export function sourceCoverageCompletenessAllowed(
+  assessment: { availableMaterialFactsComplete?: unknown; obligations?: unknown; omissions?: unknown },
+  facets: readonly Facet[], units: readonly AnswerUnit[], evidence: readonly Evidence[],
+  protocol: SourceExhaustiveProtocol, question?: string,
+): boolean {
+  const rows = assessment.obligations;
+  const omissions = assessment.omissions as { complete?: unknown; records?: unknown } | undefined;
+  if (omissions !== undefined && (!keys(omissions, ['complete', 'records']) || omissions?.complete !== true ||
+      !Array.isArray(omissions.records) || omissions.records.length > omissionLimits.records)) return false;
+  if (assessment.availableMaterialFactsComplete === true)
+    return (!omissions || (omissions.records as unknown[]).length === 0) &&
+      (!Array.isArray(rows) || !rows.some(row => row?.state === independentOmission));
+  if (protocol !== SOURCE_EXHAUSTIVE_V2_PROTOCOL || assessment.availableMaterialFactsComplete !== false ||
+      !question || !Array.isArray(omissions?.records) || !omissions.records.length ||
+      !facets.every(facet => facet.obligations.length === 1) || !Array.isArray(rows) ||
+      !rows.every(row => row?.state === 'COMPLETE' || row?.state === independentOmission)) return false;
+
+  const gaps = rows.filter(row => row.state === independentOmission);
+  const aspects = new Map<string, string>();
+  const cited = new Set<string>();
+  for (const omission of omissions.records) {
+    if (!keys(omission, ['obligationId', 'requestedAspect', 'evidenceId', 'exactQuote', 'classification', 'affectedUnitIds']) ||
+        !boundedText(omission.obligationId, omissionLimits.id) || !boundedText(omission.requestedAspect, omissionLimits.aspect, 8) ||
+        !boundedText(omission.evidenceId, omissionLimits.id) || !boundedText(omission.exactQuote, omissionLimits.quote) ||
+        omission.classification !== 'INDEPENDENT' || !same(omission.affectedUnitIds, [])) return false;
+    const gap = gaps.find(row => row.obligationId === omission.obligationId);
+    if (!gap) return false;
+    const obligation = facets.find(facet => facet.id === gap.facetId)?.obligations.find(o => o.id === omission.obligationId);
+    const aspect = omission.requestedAspect;
+    if (obligation?.questionType !== 'description' || resolveEvidenceQuote(question, aspect).quote !== aspect ||
+        resolveEvidenceQuote(obligation.description, aspect).quote !== aspect) return false;
+    if (facets.length === 1 ? !standaloneCompoundAspect(obligation.description, aspect) : aspect !== obligation.description) return false;
+    const item = evidence.find(e => e.id === omission.evidenceId);
+    if (!item) return false;
+    const { quote, start, end } = resolveEvidenceQuote(item.text, omission.exactQuote);
+    if (quote !== omission.exactQuote || start === undefined || end === undefined ||
+        item.citationRanges && !item.citationRanges.some(span => start >= span.start && end <= span.end)) return false;
+    const key = JSON.stringify([item.id, start, end]);
+    const overlaps = units.some(unit => unit.evidenceRefs.some(ref => {
+      if (ref.evidenceId !== item.id) return false;
+      const bound = resolveEvidenceQuote(item.text, ref.exactQuote);
+      return bound.start === undefined || bound.end === undefined || start < bound.end && end > bound.start;
+    }));
+    if (cited.has(key) || aspects.has(gap.obligationId) && aspects.get(gap.obligationId) !== aspect || overlaps) return false;
+    cited.add(key);
+    aspects.set(gap.obligationId, aspect);
+  }
+  return same([...aspects.keys()], gaps.map(row => row.obligationId));
+}
+
+/** Called after the shared omission validator has bound the request and evidence. */
+export function omissionRequestedAspect(assessment: any, obligationId: string): string | undefined {
+  return assessment.omissions?.records?.find((row: any) => row.obligationId === obligationId)?.requestedAspect;
+}
+
+export function independentSourceOmissionAllowed(
+  state: unknown, questionType: Facet['questionType'], reason: unknown, materialUnitIds: unknown,
+  obligationUnitIds: unknown, validIds: readonly string[], compound: boolean,
+): boolean {
+  return state === independentOmission && questionType === 'description' && reason === 'MISSING_RELEVANT_FACT' &&
+    same(obligationUnitIds, []) && same(materialUnitIds, validIds) && (compound || validIds.length === 0);
 }
 
 /** Pure contract assessment. No tenant enrolment, model invocation, rendering or
  * authority minting. All independent judgments and identities must agree. */
 export function assessSourceCoverage(raw: any, facets: readonly Facet[], units: readonly AnswerUnit[],
   evidence: readonly Evidence[], businessId: number | undefined,
-  protocol: SourceExhaustiveProtocol = SOURCE_EXHAUSTIVE_PROTOCOL): SourceCoverageAssessment {
+  protocol: SourceExhaustiveProtocol = SOURCE_EXHAUSTIVE_PROTOCOL, question?: string): SourceCoverageAssessment {
   const coverageDenied = (guard: string): SourceCoverageAssessment => {
     if (process.env.ODINLINK_KNOWLEDGE_COVERAGE_DIAGNOSTICS === '1') {
       console.warn('[SourceCoverageDenied]', JSON.stringify({
@@ -117,9 +221,8 @@ export function assessSourceCoverage(raw: any, facets: readonly Facet[], units: 
     new Set(units.map(u => u.id)).size !== units.length) return coverageDenied('GUARD_02');
   if (!keys(raw, ['decisions', 'coverage', 'sourceCoverage'])) return coverageDenied('GUARD_03');
   const s = raw.sourceCoverage;
-  if (!keys(s, ['protocol', 'requestAligned', 'availableMaterialFactsComplete', 'conditionsPreserved', 'conflictsAbsent',
-    'evidenceIdsReviewed', 'acceptedUnitIdsReviewed', 'obligations']) || s.protocol !== protocol ||
-    s.requestAligned !== true || s.availableMaterialFactsComplete !== true || s.conditionsPreserved !== true || s.conflictsAbsent !== true ||
+  if (!sourceCoverageShapeValid(s, protocol) || s.protocol !== protocol ||
+    s.requestAligned !== true || !sourceCoverageCompletenessAllowed(s, facets, units, evidence, protocol, question) || s.conditionsPreserved !== true || s.conflictsAbsent !== true ||
     !same(s.evidenceIdsReviewed, evidence.map(e => e.id)) || !same(s.acceptedUnitIdsReviewed, units.map(u => u.id))) return coverageDenied('GUARD_04');
   if (!Array.isArray(raw.decisions) || raw.decisions.length !== units.length || !same(raw.decisions.map((d: any) => d?.unitId), units.map(u => u.id))) return coverageDenied('GUARD_05');
   for (const u of units) {
@@ -148,12 +251,17 @@ export function assessSourceCoverage(raw: any, facets: readonly Facet[], units: 
         const covers = o.questionType === 'description' || units.some(u => d.unitIds.includes(u.id) &&
           (o.questionType === 'permission' ? u.modality === 'permitted' || u.modality === 'prohibited' && !u.negation :
             u.modality === ({ requirement: 'required', recommendation: 'recommended', prohibition: 'prohibited' } as const)[o.questionType]));
-        if (!covers || !c.materialFactsComplete || c.incompletenessReason !== 'NONE' || d.status !== 'COVERED' || !d.unitIds.length || !c.materialUnitIds.length) return coverageDenied('GUARD_10');
+        if (!covers || !c.materialFactsComplete || c.incompletenessReason !== 'NONE' || d.status !== 'COVERED' || !d.unitIds.length ||
+          !c.materialUnitIds.length || s.availableMaterialFactsComplete === false &&
+            (!same(d.unitIds, validIds) || !same(c.materialUnitIds, validIds))) return coverageDenied('GUARD_10');
       } else {
         if (d.status !== 'UNRESOLVED' || c.materialFactsComplete || c.incompletenessReason === 'NONE' ||
           o.questionType === 'requirement' && d.unitIds.length !== 0 ||
-          !(a.state === 'REQUESTED_INFORMATION_NOT_VERIFIED' && o.questionType === 'description' || a.state === 'UNRESOLVED_REQUIREMENT' && o.questionType === 'requirement')) return coverageDenied('GUARD_11');
-        unavailable.push(Object.freeze({ facetId: f.id, obligationId: o.id, state: a.state }));
+          !(a.state === 'REQUESTED_INFORMATION_NOT_VERIFIED' && o.questionType === 'description' || a.state === 'UNRESOLVED_REQUIREMENT' && o.questionType === 'requirement' ||
+            independentSourceOmissionAllowed(a.state, o.questionType, c.incompletenessReason,
+              c.materialUnitIds, d.unitIds, validIds, facets.length === 1))) return coverageDenied('GUARD_11');
+        unavailable.push(Object.freeze({ facetId: f.id, obligationId: o.id, state: a.state,
+          ...(a.state === independentOmission ? { requestedAspect: omissionRequestedAspect(s, o.id) } : {}) }));
       }
     }
   }

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import test, { type TestContext } from 'node:test';
 import { InMemoryKnowledgeStorage, KnowledgeService, knowledgeSourceRevision, type KnowledgeSearchMatch, type KnowledgeSource } from '../../knowledge';
+import type { SourceLanguage } from '../knowledge/semantic-queries';
 import { admitted, readySources } from '../../tests/helpers/admotion-current-inventory';
 import { answerEvidence } from '../ai/business-information-answer-plan';
 import { accuracyFirstExtractionAllowance, ACCURACY_FIRST_POLICY } from '../ai/knowledge-timing-policy';
@@ -59,6 +60,46 @@ const cases = [
   ['telegram', 'fa', 'کجا می توانم ماشینم را پارک کنم?', ['پارکینگ در حیاط پشت استودیو قرار دارد.']],
   ['whatsapp', 'ar', 'أين يوجد موقف السيارات?', ['يوجد موقف السيارات في الفناء الخلفي للاستوديو.']],
 ] as const;
+// Six synthetic units bound to the captured source text. These are fixture
+// propositions, not a transcript of the six units from 20:10.
+const sixFirstVisitFacts = [...capturedFacts.slice(0, 3), ...[
+  'Besökare ska använda porten märkt Aurora 7.',
+  'Besökare ska därefter följa de blå skyltarna till receptionen.',
+  'Receptionen ligger på andra våningen.',
+].map((text, index) => ({ quote: capturedFacts[3].quote, text, modality: index === 2 ? 'descriptive' : 'required' }))];
+type Entry = readonly [Channel, SourceLanguage, string, readonly string[]];
+type PartialCase = 'incident' | 'optional' | 'condition' | 'conflict' | 'number' | 'citation' | 'stale' | 'independent' | 'linked'
+  | 'compound' | 'compound-after-repair' | 'missing-records' | 'unknown-dependency' | 'linked-condition' | 'affected-unit'
+  | 'forged-evidence' | 'inexact-quote' | 'reused-unit-quote' | 'wrong-aspect' | 'incomplete-inventory';
+type PartialFixture = { kind: PartialCase; missingFact?: string };
+const compoundAspect = 'hur hittar jag till entrén?';
+const isCompound = (kind?: PartialCase) => kind === 'compound' || kind === 'compound-after-repair';
+const independentCases = [
+  { channel: 'telegram', language: 'sv',
+    question: 'Jag ska besöka studion för första gången. Var ligger entrén? Var finns parkeringen? Var ligger receptionen? Var finns förvaringsskåpen?',
+    facts: ['Entrén ligger på innergården.', 'Parkeringen ligger bakom studion.', 'Receptionen ligger på andra våningen.'],
+    missing: 'Förvaringsskåpen finns vid kapprummet.', notice: 'Det fullständiga svaret på ”Var finns förvaringsskåpen?” kan inte bekräftas utifrån den tillgängliga informationen.' },
+  { channel: 'whatsapp', language: 'en',
+    question: 'I am visiting the studio for the first time. Where is the entrance? Where is the parking? Where is the reception? Where are the lockers?',
+    facts: ['The entrance is in the courtyard.', 'Parking is behind the studio.', 'Reception is on the second floor.'],
+    missing: 'The lockers are by the cloakroom.', notice: 'The full answer to “Where are the lockers?” cannot be confirmed from the available information.' },
+  { channel: 'instagram', language: 'de',
+    question: 'Ich besuche AdMotion Studio zum ersten Mal. Wo ist der Eingang? Wo ist der Parkplatz? Wo ist der Empfang? Wo sind die Schließfächer?',
+    facts: ['Der Eingang liegt im Innenhof.', 'Der Parkplatz liegt hinter dem Studio.', 'Der Empfang ist im zweiten Stock.'],
+    missing: 'Die Schließfächer sind neben der Garderobe.', notice: 'Die vollständige Antwort auf „Wo sind die Schließfächer?“ kann anhand der verfügbaren Informationen nicht bestätigt werden.' },
+  { channel: 'messenger', language: 'es',
+    question: 'Voy a visitar el estudio por primera vez. ¿Dónde está la entrada? ¿Dónde está el aparcamiento? ¿Dónde está la recepción? ¿Dónde están las taquillas?',
+    facts: ['La entrada está en el patio.', 'El aparcamiento está detrás del estudio.', 'La recepción está en la segunda planta.'],
+    missing: 'Las taquillas están junto al guardarropa.', notice: 'La respuesta completa a «¿Dónde están las taquillas?» no puede confirmarse con la información disponible.' },
+  { channel: 'telegram', language: 'fa',
+    question: 'برای اولین بار به استودیو می‌آیم. ورودی کجاست؟ پارکینگ کجاست؟ پذیرش کجاست؟ کمدها کجا هستند؟',
+    facts: ['ورودی در حیاط است.', 'پارکینگ پشت استودیو است.', 'پذیرش در طبقه دوم است.'],
+    missing: 'کمدها کنار رختکن هستند.', notice: 'پاسخ کامل به «کمدها کجا هستند؟» را نمی‌توان بر اساس اطلاعات موجود تأیید کرد.' },
+  { channel: 'whatsapp', language: 'ar',
+    question: 'سأزور الاستوديو للمرة الأولى. أين يقع المدخل؟ أين يقع موقف السيارات؟ أين يقع الاستقبال؟ أين توجد الخزائن؟',
+    facts: ['يقع المدخل في الفناء.', 'يقع موقف السيارات خلف الاستوديو.', 'يقع الاستقبال في الطابق الثاني.'],
+    missing: 'تقع الخزائن بجوار غرفة تبديل الملابس.', notice: 'لا يمكن تأكيد الإجابة الكاملة عن «أين توجد الخزائن؟» من المعلومات المتاحة.' },
+] as const;
 const config = { id: 3, businessId: 3, businessName: 'AdMotion Studio', timezone: 'Europe/Stockholm',
   channelConnectionId: 'synthetic-connection', telegramToken: '123456:synthetic-offline', telegramBusinessResolved: true,
   whatsappPhoneNumberId: accounts.whatsapp, whatsappAccessToken: 'synthetic-only',
@@ -80,6 +121,63 @@ function verifier(data: any, mode: Mode) {
       acceptedUnitIdsReviewed: accepted, obligations: data.facets.flatMap((f: any) => f.obligations.map((o: any) => ({
         facetId: f.id, obligationId: o.id, state: complete ? 'COMPLETE' : 'AVAILABLE_SOURCE_FACT_OMITTED',
       }))) },
+  };
+}
+
+function partialVerifier(data: any, { kind, missingFact }: PartialFixture) {
+  const verdict = verifier(data, 'ok');
+  if (kind === 'optional') {
+    // The PDF also recommends reading the studio information before visiting.
+    // The fixture verifier judges that unrequested advice independent of the
+    // requested arrival time and access directions.
+    assert.equal(data.units.length, 6);
+    assert.ok(data.evidence.some((item: any) => item.text.includes('Vi rekommenderar att alla besökare läser igenom informationen')));
+    return { ...verdict, sourceCoverage: { ...verdict.sourceCoverage, omissions: { complete: true, records: [] } } };
+  }
+  const compound = isCompound(kind);
+  const independent = compound || !!missingFact;
+  const condition = kind === 'condition';
+  const gapFacet = compound || condition ? data.facets[0] : missingFact ? data.facets[3] : undefined;
+  const gaps = gapFacet ? [gapFacet.id] : data.facets.map((facet: any) => facet.id);
+  const omittedQuotes = compound || condition ? capturedFacts.slice(2, condition ? 3 : undefined).map(fact => {
+    const evidence = data.evidence.find((item: any) => fact.quote.test(item.text));
+    assert.ok(evidence);
+    return evidence.text.match(fact.quote)[0];
+  }) : missingFact ? [kind === 'reused-unit-quote' ? data.units[0].evidenceRefs[0].exactQuote : missingFact] : [];
+  const omissions = (independent || condition) && kind !== 'missing-records' ? {
+    complete: kind !== 'incomplete-inventory',
+    records: omittedQuotes.map(exactQuote => ({
+      obligationId: gapFacet.obligations[0].id,
+      requestedAspect: kind === 'wrong-aspect' ? data.facets[0].obligations[0].description
+        : compound || condition ? compoundAspect : gapFacet.obligations[0].description,
+      evidenceId: kind === 'forged-evidence' ? 'invented-evidence' : data.evidence.find((e: any) => e.text.includes(exactQuote)).id,
+      exactQuote: kind === 'inexact-quote' ? exactQuote + ' Altered.' : exactQuote,
+      classification: kind === 'unknown-dependency' ? 'UNKNOWN' : kind === 'linked-condition' || condition ? 'LINKED' : 'INDEPENDENT',
+      affectedUnitIds: condition ? [data.units.find((unit: any) => unit.text === 'Studions entré ligger på innergården.').id]
+        : kind === 'linked-condition' || kind === 'affected-unit' ? [data.units[0].id] : [],
+    })),
+  } : undefined;
+  const reason = kind === 'condition' ? 'MISSING_CONDITION' : 'MISSING_RELEVANT_FACT';
+  if (kind === 'condition') {
+    assert.ok(data.evidence.some((item: any) => item.text.includes('inte vid huvudingången mot gatan')));
+    assert.ok(data.units.some((unit: any) => unit.text === 'Studions entré ligger på innergården.'));
+    assert.ok(data.units.every((unit: any) => !unit.text.includes('huvudingången')));
+  }
+  return {
+    ...verdict,
+    coverage: verdict.coverage.map(row => {
+      const unitIds = data.units.filter((unit: any) => unit.facetIds.includes(row.facetId)).map((unit: any) => unit.id);
+      const gap = gaps.includes(row.facetId);
+      return { ...row, materialFactsComplete: !gap, materialUnitIds: unitIds,
+        incompletenessReason: gap ? reason : 'NONE',
+        obligations: row.obligations.map((obligation: any) => ({ ...obligation,
+          status: gap ? 'UNRESOLVED' : 'COVERED', unitIds: gap ? [] : unitIds })) };
+    }),
+    sourceCoverage: { ...verdict.sourceCoverage, availableMaterialFactsComplete: false, ...(omissions ? { omissions } : {}),
+      conditionsPreserved: kind !== 'condition', conflictsAbsent: kind !== 'conflict',
+      obligations: verdict.sourceCoverage.obligations.map((row: any) => ({ ...row, state: !gaps.includes(row.facetId) ? 'COMPLETE' :
+        independent ? 'INDEPENDENT_REQUESTED_FACT_OMITTED' : kind === 'condition' ? 'MISSING_CONDITION' : 'AVAILABLE_SOURCE_FACT_OMITTED' })),
+    },
   };
 }
 
@@ -113,21 +211,22 @@ test('managed durable oversized-empty recovery through native intake and Postgre
       text: row.content, score: row.score, metadata: row.metadata }));
   }
 
-  async function run(st: TestContext, entry: typeof cases[number], mode: Mode, variant: 'synthetic' | 'foreground' | 'lexical' = 'synthetic') {
+  async function run(st: TestContext, entry: Entry, mode: Mode, variant: 'synthetic' | 'foreground' | 'lexical' = 'synthetic', partial?: PartialFixture) {
     const [channel, language, question, facts] = entry;
     const foreground = variant === 'foreground';
+    const fixtureCorpus = variant !== 'synthetic' && !partial?.missingFact;
     const patchExpected = process.env.ODINLINK_PARITY_UNPATCHED !== '1';
     const providerAccount = accounts[channel], recipient = String(46700000000 + ++serial);
-    const sourceText = [facts.slice(language === 'sv' ? 1 : 0).join(' '), 'Documents describe the studio and visitor services.',
+    const sourceText = partial?.missingFact ? [facts[0], facts.slice(1).join(' '), partial.missingFact] : [facts.slice(language === 'sv' ? 1 : 0).join(' '), 'Documents describe the studio and visitor services.',
       language === 'sv' ? facts[0] : 'Visit details are available from the studio.'];
     let sources: KnowledgeSource[] = sourceText.map((content, i) => ({
       id: `source-${i}`, businessId: 3, type: 'document', title: `Fixture source ${i}`,
       content, status: 'ready', createdAt: 'synthetic', updatedAt: 'synthetic', metadata: { segments: [{ text: content }] },
     }));
-    if (variant !== 'synthetic') sources = captured;
+    if (fixtureCorpus) sources = captured;
     const storage = new InMemoryKnowledgeStorage();
     const service = new KnowledgeService(storage, storage, null);
-    if (variant !== 'synthetic') for (const source of sources) await storage.create(source);
+    if (fixtureCorpus) for (const source of sources) await storage.create(source);
     const owner = new ScriptedKnowledgeBudgetOwner();
     owner.businessIds = [3];
     const quotes: KnowledgeSolStage[] = [], calls: KnowledgeSolStage[] = [], posts: string[] = [], failures: string[] = [];
@@ -151,7 +250,7 @@ test('managed durable oversized-empty recovery through native intake and Postgre
     if (mode === 'other-protocol') process.env.ODINLINK_KNOWLEDGE_VERIFIER_PROTOCOL = 'v2';
     let activeStage: KnowledgeSolStage | undefined;
     const diagnostics: Record<string, unknown>[] = [];
-    const summaries: any[] = [];
+    const summaries: any[] = [], decisions: any[] = [];
     const wires: any[] = [];
     let original: { content: string; schema: unknown } | undefined;
     const response = (body: unknown) => Response.json(body);
@@ -166,9 +265,9 @@ test('managed durable oversized-empty recovery through native intake and Postgre
         assert.equal(wire.model, 'gpt-6.1-sol');
         assert.equal(wire.max_output_tokens, 8192);
         assert.equal(wire.reasoning.effort, 'low');
-        assert.equal(data.question, question);
+        assert.equal(data.question, question.replaceAll('؟', '?').replaceAll('‌', ' '));
         assert.equal(data.requestedLanguage, language);
-        assert.equal(data.evidence.length, variant === 'synthetic' ? 3 : 5);
+        assert.equal(data.evidence.length, fixtureCorpus ? 5 : 3);
         assert.ok(data.evidence.every((item: any) => item.businessId === 3));
         const hold = [...owner.reservations.values()].find(r => r.quote.stage === stage);
         assert.ok(quotes.includes(stage) && hold);
@@ -183,28 +282,47 @@ test('managed durable oversized-empty recovery through native intake and Postgre
           assert.deepEqual({ content, schema: wire.text.format }, original);
           assert.match(wire.instructions, /Reassess the whole question/);
         }
-        const units = variant === 'synthetic' ? facts.map((fact, i) => ({ facetIds: data.facets.map((f: any) => f.id),
+        const units = !fixtureCorpus ? facts.map((fact, i) => ({ facetIds: partial?.missingFact
+          ? [data.facets[i].id, ...(partial.kind === 'linked' && i === 0 ? [data.facets[3].id] : [])]
+          : data.facets.map((f: any) => f.id),
           subject: 'AdMotion Studio', predicate: 'visitor information', value: fact,
-          modality: language === 'sv' && i === 0 ? 'recommended' : 'descriptive', negation: false,
+          modality: !partial?.missingFact && language === 'sv' && i === 0 ? 'recommended' : 'descriptive', negation: false,
           scope: 'studio visitors', qualifiers: [], language, text: mode === 'number' && i === 0 ? fact.replace('10', '99') : fact,
           evidenceRefs: [{ evidenceId: data.evidence.find((e: any) => e.text.includes(fact))?.id,
-            exactQuote: mode === 'citation' && i === 0 ? fact + ' Altered.' : fact }] })) : capturedFacts.map(fact => {
+            exactQuote: mode === 'citation' && i === 0 ? fact + ' Altered.' : fact }] })) : (isCompound(partial?.kind) ? sixFirstVisitFacts.slice(0, 2) : partial ? sixFirstVisitFacts : capturedFacts).map((fact, index) => {
           const item = data.evidence.find((e: any) => fact.quote.test(e.text));
           assert.ok(item, 'original source wording must appear on the selected wire');
           const quote = item.text.match(fact.quote)[0];
-          if (fact.modality === 'required') assert.match(quote, /andra\nvåningen/);
+          if (fact.quote === capturedFacts[3].quote) assert.match(quote, /andra\nvåningen/);
           return { facetIds: data.facets.map((f: any) => f.id), subject: 'AdMotion Studio', predicate: 'besöksinformation',
             value: fact.text, modality: fact.modality, negation: false, scope: 'studiobesök', qualifiers: [], language,
-            text: fact.text, evidenceRefs: [{ evidenceId: item.id, exactQuote: quote }] };
+            text: partial?.kind === 'number' && index === 0 ? fact.text.replace('10', '99')
+              : partial?.kind === 'condition' && index === 2 ? 'Studions entré ligger på innergården.' : fact.text,
+            evidenceRefs: [{ evidenceId: item.id, exactQuote: partial?.kind === 'citation' && index === 0 ? quote + ' Ändrat.' : quote }] };
         });
-        const payload = stage === 'verification' ? verifier(data, mode) : foreground || stage === 're_extraction' && mode !== 'repeat'
+        if (partial?.missingFact) {
+          assert.equal(data.facets.length, 4);
+          assert.ok(data.evidence.some((item: any) => item.text.includes(partial.missingFact)));
+        }
+        if (stage === 'verification' && partial?.kind === 'optional') {
+          assert.match(wire.instructions, /Unrequested context that cannot affect the answer does not make either completeness flag false/u);
+          const schema = wire.text.format.schema.properties.sourceCoverage;
+          assert.ok(schema.required.includes('omissions'));
+          const records = schema.properties.omissions.properties.records;
+          assert.equal(records.maxItems, 6);
+          assert.equal(records.items.additionalProperties, false);
+          assert.deepEqual(records.items.required, ['obligationId', 'requestedAspect', 'evidenceId', 'exactQuote', 'classification', 'affectedUnitIds']);
+          assert.equal(records.items.properties.exactQuote.maxLength, 600);
+        }
+        const firstPassFixture = partial && partial.kind !== 'compound-after-repair';
+        const payload = stage === 'verification' ? partial ? partialVerifier(data, partial) : verifier(data, mode) : firstPassFixture || foreground || stage === 're_extraction' && mode !== 'repeat'
           ? mode === 'repair-incomplete' ? { units } : { oversized: false, units }
           : stage === 'extraction' && mode === 'ordinary-empty' ? { oversized: false, units: [] } : oversizedEmpty;
         const status = stage === 'extraction' && mode === 'truncated' ? 'incomplete' : 'completed';
         const refused = stage === 'extraction' && mode === 'refused' || stage === 're_extraction' && mode === 'repair-refused';
         const output = refused ? { type: 'refusal', refusal: 'fixture' }
           : { type: 'output_text', text: stage === 'extraction' && mode === 'malformed' ? '{broken' : JSON.stringify(payload), annotations: [] };
-        if (stage === 'extraction' && mode === 'changed') changeSource();
+        if (stage === 'extraction' && mode === 'changed' || stage === 'verification' && partial?.kind === 'stale') changeSource();
         if (stage === 'extraction' && mode === 'changed-chunk') {
           // Change a canonical PDF chunk without varying its length, timestamp or
           // document segment metadata. Strict validation must reject the old pin.
@@ -251,6 +369,7 @@ test('managed durable oversized-empty recovery through native intake and Postgre
     for (const level of ['log', 'warn', 'error'] as const) st.mock.method(console, level, () => {});
     st.mock.method(console, 'info', (label, body) => {
       if (label === '[EvidenceFirstKnowledge]') summaries.push(JSON.parse(body));
+      if (label === '[EvidenceFirstDecision]') decisions.push(JSON.parse(body));
     });
     const connection: ResolvedChannelConnection = {
       id: `connection-${channel}`, businessId: 3, provider: channel, providerAccountId: providerAccount,
@@ -277,11 +396,11 @@ test('managed durable oversized-empty recovery through native intake and Postgre
     b.reset();
     b.configure({ nativeKnowledgeRuntime: runtime, offlineAi: true, semanticLanguageResolver: async () => ({ language, confidence: 1 }),
       postProcess: async () => {}, incrementUsage: async () => ({ allowed: true, count: 1, limit: 1000 }),
-      knowledgeSourceLanguages: async () => [language], completeKnowledgeCorpus: async () => foreground ? corpus : null,
+      knowledgeSourceLanguages: async () => [language], completeKnowledgeCorpus: async () => foreground && fixtureCorpus ? corpus : null,
       knowledgeRetrievalDiagnostic: event => diagnostics.push(event),
-      knowledgeSearch: async (business, query, limit) => variant !== 'synthetic' ? lexical(business, query, limit) : sources.map(s => ({ businessId: mode === 'foreign-evidence' ? 77 : 3, sourceId: s.id,
+      knowledgeSearch: async (business, query, limit) => fixtureCorpus ? lexical(business, query, limit) : sources.map(s => ({ businessId: mode === 'foreign-evidence' ? 77 : 3, sourceId: s.id,
         text: s.content, score: 1, metadata: { source: 'document', documentRevision: knowledgeSourceRevision(s) } })),
-      validateKnowledgeMatches: async (id, matches) => variant !== 'synthetic'
+      validateKnowledgeMatches: async (id, matches) => fixtureCorpus
         ? service.validateMatches(id, matches, { strictSources: true, captureRevision: true, requireCompleteDocumentContext: true })
         : matches.filter(m => sources.some(s => s.id === m.sourceId &&
         s.businessId === m.businessId && knowledgeSourceRevision(s) === (m.metadata?.documentRevision ?? m.metadata?.sourceRevision))),
@@ -300,7 +419,7 @@ test('managed durable oversized-empty recovery through native intake and Postgre
       return channel === 'instagram' ? b.instagramInbound(input, cfg) : b.messengerInbound(input, cfg);
     };
     await inbound();
-    if (foreground) return { calls, quotes, task: null, outbox: [], posts, failures, unknown: [], diagnostics, wires, summaries };
+    if (foreground) return { calls, quotes, task: null, outbox: [], posts, failures, unknown: [], diagnostics, wires, summaries, decisions };
     const accepted = JSON.parse(pg.sql('SELECT to_jsonb(t) FROM odin_tasks t ORDER BY created_at DESC LIMIT 1;'));
     taskId = accepted.id;
     conversationId = accepted.conversation_id;
@@ -322,7 +441,7 @@ test('managed durable oversized-empty recovery through native intake and Postgre
       await runtime.tick();
     }
     const outbox = JSON.parse(pg.sql(`SELECT coalesce(jsonb_agg(knowledge_state),'[]'::jsonb) FROM odin_outbox WHERE knowledge_task_id = '${taskId}';`));
-    return { calls, quotes, task: task(), outbox, posts, failures, diagnostics, wires, summaries,
+    return { calls, quotes, task: task(), outbox, posts, failures, diagnostics, wires, summaries, decisions,
       unknown: [...owner.reservations.values()].filter(r => r.unknown).map(r => r.quote.stage) };
   }
 
@@ -419,6 +538,109 @@ test('managed durable oversized-empty recovery through native intake and Postgre
     assert.deepEqual(result.posts, [safeUnavailableKnowledge('sv').text]);
   });
   if (process.env.ODINLINK_PARITY_ONLY === '1') return;
+
+  for (const kind of ['incident', 'optional', 'condition', 'conflict', 'number', 'citation'] as const) {
+    await t.test(`Swedish incident fixture: ${kind}`, async st => {
+      const result = await run(st, cases[0], 'ok', 'foreground', { kind });
+      assert.deepEqual(result.failures, []);
+      assert.equal(result.posts.length, 1);
+      assert.equal(result.posts[0].includes('Aurora 7'), kind === 'optional');
+      if (kind === 'optional') {
+        assert.deepEqual(result.calls, ['extraction', 'verification']);
+        for (const fact of sixFirstVisitFacts) assert.ok(result.posts[0].includes(fact.text));
+        assert.equal(result.summaries[0]?.semanticVerifiedUnits, 6);
+        assert.ok(!result.posts[0].includes('läser igenom informationen'));
+      }
+      const reason = { incident: 'AVAILABLE_FACTS_INCOMPLETE', condition: 'CONDITIONS_NOT_PRESERVED', conflict: 'CONFLICTS_PRESENT' } as const;
+      if (kind === 'incident' || kind === 'condition' || kind === 'conflict') {
+        assert.equal(result.summaries[0]?.semanticVerifiedUnits, 6);
+        const rejection = result.decisions.find(event => event.reason === 'INVALID_COVERAGE');
+        assert.equal(rejection?.sourceCoverage.guard, 'GUARD_04');
+        assert.deepEqual(rejection.sourceCoverage.failedChecks, kind === 'incident'
+          ? [reason.incident] : [reason.incident, reason[kind]]);
+      }
+      if (kind === 'incident') {
+        assert.deepEqual(result.calls, ['extraction', 'verification']);
+        assert.deepEqual(result.quotes, result.calls);
+        for (const fact of sixFirstVisitFacts) assert.ok(!result.posts[0].includes(fact.text), fact.text);
+        assert.ok(!result.decisions.some(event => event.reason === 'SOURCE_COVERAGE_ACCEPTED'));
+        const publication = result.decisions.filter(event => event.eventType === 'publication' && event.route);
+        assert.ok(publication.length > 0);
+        assert.ok(publication.every(event => event.route === 'unavailable' && event.publishableUnits === 0));
+      }
+      if (kind === 'number' || kind === 'citation') {
+        assert.deepEqual(result.calls, ['extraction']);
+        assert.ok(!result.posts[0].includes('99'));
+      }
+    });
+  }
+
+  await t.test('Swedish compound: an independent source-bound omission qualifies the arrival recommendation', async st => {
+    const result = await run(st, cases[0], 'ok', 'foreground', { kind: 'compound' });
+    assert.deepEqual(result.failures, []);
+    assert.deepEqual(result.calls, ['extraction', 'verification']);
+    assert.deepEqual(result.quotes, result.calls);
+    assert.equal(result.posts.length, 1);
+    for (const fact of sixFirstVisitFacts.slice(0, 2)) assert.ok(result.posts[0].includes(fact.text), result.posts[0]);
+    assert.match(result.posts[0], /Det fullständiga svaret på ”hur hittar jag till entrén\?” kan inte bekräftas/u);
+    assert.ok(!result.posts[0].includes('Aurora 7'));
+    const accepted = result.decisions.find(event => event.reason === 'SOURCE_COVERAGE_ACCEPTED');
+    assert.equal(accepted?.sourceCoverage.state, 'SCOPED_PARTIAL');
+    assert.equal(accepted?.sourceCoverage.guard, 'NONE');
+    assert.ok(!JSON.stringify(accepted.sourceCoverage).includes(compoundAspect), 'the decision record remains content-free');
+    assert.ok(!JSON.stringify(accepted.sourceCoverage).includes('Aurora 7'));
+  });
+
+  await t.test('durable oversized-empty recovery still vetoes an otherwise certified partial', async st => {
+    const result = await run(st, cases[0], 'ok', 'lexical', { kind: 'compound-after-repair' });
+    assert.deepEqual(result.failures, []);
+    assert.deepEqual(result.calls, ['extraction', 're_extraction', 'verification']);
+    assert.deepEqual(result.quotes, result.calls);
+    assert.deepEqual(result.posts, [safeUnavailableKnowledge('sv').text]);
+    assert.deepEqual(result.outbox, ['SENT']);
+    assert.equal(result.task.knowledge_result.protocol, 'safe-unavailable-v1');
+  });
+
+  for (const row of independentCases) {
+    for (const host of ['foreground', 'durable'] as const) await t.test(`${host}/${row.channel}/${row.language}: publish three answers and acknowledge the fourth`, async st => {
+      const entry: Entry = [row.channel, row.language, row.question, row.facts];
+      const result = await run(st, entry, 'ok', host === 'foreground' ? 'foreground' : 'synthetic',
+        { kind: 'independent', missingFact: row.missing });
+      assert.deepEqual(result.failures, []);
+      assert.deepEqual(result.calls, ['extraction', 'verification'], JSON.stringify({ posts: result.posts, decisions: result.decisions }));
+      assert.deepEqual(result.quotes, result.calls);
+      assert.equal(result.posts.length, 1);
+      for (const fact of row.facts) assert.ok(result.posts[0].includes(fact), fact);
+      assert.ok(result.posts[0].includes(row.notice), result.posts[0]);
+      assert.ok(!result.posts[0].includes(row.missing));
+      const accepted = result.decisions.find(event => event.reason === 'SOURCE_COVERAGE_ACCEPTED');
+      assert.equal(accepted?.sourceCoverage.state, 'SCOPED_PARTIAL');
+      assert.equal(accepted?.sourceCoverage.guard, 'NONE');
+      assert.deepEqual(result.outbox, host === 'durable' ? ['SENT'] : []);
+      if (host === 'durable') {
+        assert.equal(result.task.knowledge_result.protocol, 'evidence-first-partial-v1');
+        assert.equal(result.task.knowledge_result.completeRequiredFacts, false);
+        assert.equal(result.task.knowledge_result.independentlyVerified, true);
+      }
+    });
+  }
+
+  for (const kind of ['linked', 'stale', 'missing-records', 'unknown-dependency', 'linked-condition',
+    'affected-unit', 'forged-evidence', 'inexact-quote', 'reused-unit-quote', 'wrong-aspect', 'incomplete-inventory'] as const) {
+    await t.test(`durable scoped omission stays closed when ${kind}`, async st => {
+      const { channel, language, question, facts, missing } = independentCases[1];
+      const result = await run(st, [channel, language, question, facts], 'ok', 'synthetic', { kind, missingFact: missing });
+      assert.deepEqual(result.calls, ['extraction', 'verification']);
+      assert.deepEqual(result.posts, [safeUnavailableKnowledge(language).text]);
+      assert.deepEqual(result.outbox, ['SENT']);
+      assert.deepEqual(result.quotes, result.calls);
+      assert.equal(result.task.knowledge_result.protocol, 'safe-unavailable-v1');
+      if (kind !== 'stale') {
+        const rejected = result.decisions.find(event => event.reason === 'INVALID_COVERAGE');
+        assert.equal(rejected?.sourceCoverage.guard, kind === 'linked' ? 'GUARD_11' : 'GUARD_04');
+      }
+    });
+  }
 
   for (const entry of cases) await t.test(`${entry[0]}/${entry[1]} verifies exactly once after one repair`, async st => {
     const runResult = await run(st, entry, 'ok');

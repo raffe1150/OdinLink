@@ -16,7 +16,8 @@
  * already carries businessId). The serialized record is capped at
  * SOURCE_COVERAGE_DECISION_MAX_BYTES; detail arrays are dropped first.
  */
-import { assessSourceCoverage, isSourceExhaustiveProtocol, scopedPartialModalityBlocked, SOURCE_COVERAGE_STATES, SOURCE_EXHAUSTIVE_PROTOCOL,
+import { assessSourceCoverage, independentSourceOmissionAllowed, isSourceExhaustiveProtocol, omissionRequestedAspect,
+  scopedPartialModalityBlocked, sourceCoverageCompletenessAllowed, sourceCoverageShapeValid, SOURCE_COVERAGE_STATES, SOURCE_EXHAUSTIVE_PROTOCOL,
   type SourceCoverageAssessment, type SourceExhaustiveProtocol } from './source-exhaustive-coverage';
 import type { AnswerUnit, Evidence, Facet } from './business-information-answer-plan';
 import type { KnowledgeDecision } from './knowledge-answer-protocol';
@@ -107,7 +108,7 @@ type Classification = { guard: SourceCoverageGuard; failedChecks: SourceCoverage
  * Mirrors source-exhaustive-coverage.ts; GUARD_04 sub-checks are evaluated
  * without short-circuiting so every failing one is reported. */
 function classify(raw: any, facets: readonly Facet[], units: readonly AnswerUnit[], evidence: readonly Evidence[],
-  businessId: number | undefined, protocol: SourceExhaustiveProtocol): Classification {
+  businessId: number | undefined, protocol: SourceExhaustiveProtocol, question?: string): Classification {
   const deny = (guard: SourceCoverageGuard, failedChecks: SourceCoverageCheck[]): Classification => ({ guard, failedChecks, unavailable: 0, reached12: false });
   if (!isSourceExhaustiveProtocol(protocol)) return deny('GUARD_01', ['PROTOCOL_UNSUPPORTED']);
   if (!Number.isSafeInteger(businessId) || businessId! <= 0 || !facets.length || facets.length > 4 || !units.length || units.length > 6 ||
@@ -118,12 +119,11 @@ function classify(raw: any, facets: readonly Facet[], units: readonly AnswerUnit
   if (!keys(raw, ['decisions', 'coverage', 'sourceCoverage'])) return deny('GUARD_03', ['RESPONSE_SHAPE_INVALID']);
   const s = raw.sourceCoverage;
   const g04: SourceCoverageCheck[] = [];
-  if (!keys(s, ['protocol', 'requestAligned', 'availableMaterialFactsComplete', 'conditionsPreserved', 'conflictsAbsent',
-    'evidenceIdsReviewed', 'acceptedUnitIdsReviewed', 'obligations'])) g04.push('ASSESSMENT_SHAPE_INVALID');
+  if (!sourceCoverageShapeValid(s, protocol)) g04.push('ASSESSMENT_SHAPE_INVALID');
   if (object(s)) {
     if (s.protocol !== protocol) g04.push('ASSESSMENT_PROTOCOL_MISMATCH');
     if (s.requestAligned !== true) g04.push('REQUEST_NOT_ALIGNED');
-    if (s.availableMaterialFactsComplete !== true) g04.push('AVAILABLE_FACTS_INCOMPLETE');
+    if (!sourceCoverageCompletenessAllowed(s, facets, units, evidence, protocol, question)) g04.push('AVAILABLE_FACTS_INCOMPLETE');
     if (s.conditionsPreserved !== true) g04.push('CONDITIONS_NOT_PRESERVED');
     if (s.conflictsAbsent !== true) g04.push('CONFLICTS_PRESENT');
     if (!same(s.evidenceIdsReviewed, evidence.map(e => e.id))) g04.push('EVIDENCE_INVENTORY_MISMATCH');
@@ -145,7 +145,7 @@ function classify(raw: any, facets: readonly Facet[], units: readonly AnswerUnit
     !Array.isArray(raw.coverage) || raw.coverage.length !== facets.length || !same(raw.coverage.map((c: any) => c?.facetId), facets.map(f => f.id)))
     return deny('GUARD_07', ['OBLIGATION_INVENTORY_MISMATCH']);
   let unavailable = 0;
-  const gaps: { facetId: string; state: string }[] = [];
+  const gaps: { facetId: string; state: string; requestedAspect?: string }[] = [];
   for (const f of facets) {
     const c = raw.coverage.find((c: any) => c.facetId === f.id), validIds = units.filter(u => u.facetIds.includes(f.id)).map(u => u.id);
     const subset = (ids: any) => Array.isArray(ids) && ids.every(id => typeof id === 'string' && validIds.includes(id)) && new Set(ids).size === ids.length;
@@ -161,15 +161,19 @@ function classify(raw: any, facets: readonly Facet[], units: readonly AnswerUnit
         const covers = o.questionType === 'description' || units.some(u => d.unitIds.includes(u.id) &&
           (o.questionType === 'permission' ? u.modality === 'permitted' || u.modality === 'prohibited' && !u.negation :
             u.modality === ({ requirement: 'required', recommendation: 'recommended', prohibition: 'prohibited' } as const)[o.questionType]));
-        if (!covers || !c.materialFactsComplete || c.incompletenessReason !== 'NONE' || d.status !== 'COVERED' || !d.unitIds.length || !c.materialUnitIds.length)
+        if (!covers || !c.materialFactsComplete || c.incompletenessReason !== 'NONE' || d.status !== 'COVERED' || !d.unitIds.length ||
+          !c.materialUnitIds.length || s.availableMaterialFactsComplete === false &&
+            (!same(d.unitIds, validIds) || !same(c.materialUnitIds, validIds)))
           return deny('GUARD_10', ['COMPLETE_NOT_SUPPORTED']);
       } else {
         if (d.status !== 'UNRESOLVED' || c.materialFactsComplete || c.incompletenessReason === 'NONE' ||
           o.questionType === 'requirement' && d.unitIds.length !== 0 ||
-          !(a.state === 'REQUESTED_INFORMATION_NOT_VERIFIED' && o.questionType === 'description' || a.state === 'UNRESOLVED_REQUIREMENT' && o.questionType === 'requirement'))
+          !(a.state === 'REQUESTED_INFORMATION_NOT_VERIFIED' && o.questionType === 'description' || a.state === 'UNRESOLVED_REQUIREMENT' && o.questionType === 'requirement' ||
+            independentSourceOmissionAllowed(a.state, o.questionType, c.incompletenessReason,
+              c.materialUnitIds, d.unitIds, validIds, facets.length === 1)))
           return deny('GUARD_11', ['UNAVAILABLE_STATE_NOT_PERMITTED']);
         unavailable++;
-        gaps.push({ facetId: f.id, state: a.state });
+        gaps.push({ facetId: f.id, state: a.state, requestedAspect: omissionRequestedAspect(s, o.id) });
       }
     }
   }
@@ -226,8 +230,7 @@ function details(raw: any, facets: readonly Facet[], units: readonly AnswerUnit[
   for (const k of Object.keys(unitModalities) as (keyof typeof unitModalities)[]) unitModalities[k] = cap(unitModalities[k]);
   const nonDescriptive = units.some(u => u.modality !== 'descriptive');
   return {
-    certificate: Object.freeze({ present: !!s, shapeValid: keys(s, ['protocol', 'requestAligned', 'availableMaterialFactsComplete', 'conditionsPreserved',
-      'conflictsAbsent', 'evidenceIdsReviewed', 'acceptedUnitIdsReviewed', 'obligations']), protocolMatches: s ? s.protocol === protocol : null,
+    certificate: Object.freeze({ present: !!s, shapeValid: sourceCoverageShapeValid(s, protocol), protocolMatches: s ? s.protocol === protocol : null,
       requestAligned: s ? tri(s.requestAligned) : null, availableMaterialFactsComplete: s ? tri(s.availableMaterialFactsComplete) : null,
       conditionsPreserved: s ? tri(s.conditionsPreserved) : null, conflictsAbsent: s ? tri(s.conflictsAbsent) : null }),
     evidenceInventory: s ? inventory(s.evidenceIdsReviewed, evidence.map(e => e.id)) : null,
@@ -264,10 +267,10 @@ function errorRecord(state: SourceCoverageAssessment['state'], protocol: unknown
 
 /** Pure description of an assessment already made by assessSourceCoverage(). Never throws. */
 export function describeSourceCoverageDecision(assessment: SourceCoverageAssessment, raw: unknown, facets: readonly Facet[], units: readonly AnswerUnit[],
-  evidence: readonly Evidence[], businessId: number | undefined, protocol: SourceExhaustiveProtocol = SOURCE_EXHAUSTIVE_PROTOCOL): SourceCoverageDecisionRecord {
+  evidence: readonly Evidence[], businessId: number | undefined, protocol: SourceExhaustiveProtocol = SOURCE_EXHAUSTIVE_PROTOCOL, question?: string): SourceCoverageDecisionRecord {
   try {
     let c: Classification;
-    try { c = classify(raw, facets, units, evidence, businessId, protocol); }
+    try { c = classify(raw, facets, units, evidence, businessId, protocol, question); }
     catch { c = { guard: 'UNCLASSIFIED', failedChecks: [], unavailable: 0, reached12: false }; }
     const observed = c.guard === 'NONE' ? c.unavailable ? 'SCOPED_PARTIAL' : 'COMPLETE' : c.guard === 'UNCLASSIFIED' ? undefined : 'DENIED';
     const consistent = observed === assessment.state && (assessment.state !== 'SCOPED_PARTIAL' || c.unavailable === assessment.unavailable.length);
@@ -285,9 +288,9 @@ export function describeSourceCoverageDecision(assessment: SourceCoverageAssessm
 /** Authoritative assessment, unchanged, plus its content-free decision record. */
 export function assessSourceCoverageDetailed(raw: any, facets: readonly Facet[], units: readonly AnswerUnit[],
   evidence: readonly Evidence[], businessId: number | undefined,
-  protocol: SourceExhaustiveProtocol = SOURCE_EXHAUSTIVE_PROTOCOL): { assessment: SourceCoverageAssessment; record: SourceCoverageDecisionRecord } {
-  const assessment = assessSourceCoverage(raw, facets, units, evidence, businessId, protocol);
-  return { assessment, record: describeSourceCoverageDecision(assessment, raw, facets, units, evidence, businessId, protocol) };
+  protocol: SourceExhaustiveProtocol = SOURCE_EXHAUSTIVE_PROTOCOL, question?: string): { assessment: SourceCoverageAssessment; record: SourceCoverageDecisionRecord } {
+  const assessment = assessSourceCoverage(raw, facets, units, evidence, businessId, protocol, question);
+  return { assessment, record: describeSourceCoverageDecision(assessment, raw, facets, units, evidence, businessId, protocol, question) };
 }
 
 /** Records a denial that the backend made before assessSourceCoverage() ran
