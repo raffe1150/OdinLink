@@ -5469,6 +5469,8 @@ const businessInformationTurns: Record<string, BusinessInformationTurn> = {};
 // Opt-in shared rollout. No per-channel overrides; no persistent answer/unit cache.
 type NativeKnowledgeEvent = {eventId:string;account:string;recipient:string;order:NativeKnowledgeOrder|null};
 type KnowledgeTurnState = { readonly modelProfile?: KnowledgeModelProfile; readonly extractionProtocol?: KnowledgeExtractionProtocol; readonly verificationProtocol?: KnowledgeVerificationProtocol; nativeEvent?: NativeKnowledgeEvent; nativeAsync?: {runtime:NativeKnowledgeRuntime|null;admission:NativeKnowledgeAdmission|null;failed:boolean}; durableCheckpoint?: (stage: 'extraction') => Promise<void>; durableProgress?: Parameters<KnowledgeExecutor>[1]['progress']; durableCurrent?: () => Promise<boolean>; mixedRequest?: boolean; requiresReferenceResolution?: boolean; unresolvedReference?: boolean; referenceClarificationText?: string; migrated?: boolean; budget?: InformationBudget; facets?: Facet[]; oversized?: boolean; evidence?: Evidence[];
+  ownsDurableLease?: () => Promise<boolean>;
+  repairedDurableOversizedEmpty?: boolean;
   ownerAnswerSelection?: OwnerAnswerSelection;
   ownerAnswerPublication?: { text: string; requiresCurrentApproval: boolean };
   cancellationBridge?: ReturnType<typeof createCancellationEvidenceBridge>;
@@ -5925,6 +5927,7 @@ async function knowledgeEvidenceCurrent(): Promise<boolean> {
     if(state.freshnessFailure||!state.budget.remaining()||!requestSecurity.current())return false;
     if (state.ownerAnswerSelection && state.manifest.units.length &&
         evidence.length !== state.snapshot?.evidence.length) return false;
+    if (state.repairedDurableOversizedEmpty && evidence.length !== state.snapshot?.evidence.length) return false;
     state.manifest=pruneAnswerManifest(state.manifest,evidence,emitKnowledgeDecision);
   }
   if(!state.budget.remaining()){state.freshnessFailure='DEADLINE';return false;}
@@ -6028,7 +6031,8 @@ async function generateNativeKnowledgeContent(sessionId:string,options:any,suppo
     const verificationProtocol = state.verificationProtocol ?? selectKnowledgeVerificationProtocol();
     if (state.verificationProtocol === undefined) Object.defineProperty(state, 'verificationProtocol', { value: verificationProtocol, enumerable: true });
     const configuredExtractionProtocol = state.extractionProtocol ?? selectKnowledgeExtractionProtocol();
-    const durablePublication = state.budget instanceof DurableKnowledgeBudget && state.budget.publicationV2;
+    const durableBudget = state.budget instanceof DurableKnowledgeBudget ? state.budget : undefined;
+    const durablePublication = durableBudget?.publicationV2 === true;
     const modelBinding = controlledTrialBinding() ?? Object.freeze({ businessId: state.businessId,
       turnId: durablePublication ? state.naturalTurnId! : nativeKnowledgeTiming()?.turnId ?? '',
       requestKey: crypto.createHash('sha256').update(JSON.stringify(durablePublication
@@ -6080,6 +6084,10 @@ async function generateNativeKnowledgeContent(sessionId:string,options:any,suppo
     const canaryStages: SolStageRecord[] = [], canaryEvents: KnowledgeDecision[] = [];
     let canaryReExtraction: Parameters<NonNullable<Parameters<typeof buildEvidenceFirstAnswer>[0]['reExtraction']>['record']>[0] | undefined;
     const canaryStarted = Date.now();
+    const admitReExtraction = () => reExtractionAdmission({ profile: state.modelProfile!, businessId: state.businessId!,
+      mode: state.modelProfile!.id === KNOWLEDGE_SOL_PRODUCTION_PROFILE ? 'production' : 'active',
+      generationRemainingMs: state.budget!.generationRemaining(), attempts: state.budget!.attempts,
+      maxAttempts: durableBudget ? Math.min(4, durableBudget.maxAttempts) : ANSWER_LIMITS.attempts });
     const clarification = state.nativeChannel && nativeKnowledgeTiming() && !state.mixedRequest &&
       !state.requiresReferenceResolution && !state.unresolvedReference && options.knowledgePublication === 'guarded_text'
       ? serviceSelectionClarification(support.question, language) : undefined;
@@ -6129,10 +6137,10 @@ async function generateNativeKnowledgeContent(sessionId:string,options:any,suppo
       // One-shot re-extraction: the active canary or the production managed profile.
       ...((state.modelProfile!.id === KNOWLEDGE_SOL_EXTRACTION_PROFILE && canaryMode === 'active' ||
         state.modelProfile!.id === KNOWLEDGE_SOL_PRODUCTION_PROFILE) ? { reExtraction: {
+        ...(durablePublication && state.ownsDurableLease && state.modelProfile!.id === KNOWLEDGE_SOL_PRODUCTION_PROFILE
+          ? { durableOversizedEmpty: true as const } : {}),
         record: event => { canaryReExtraction = event; },
-        admit: () => reExtractionAdmission({ profile: state.modelProfile!, businessId: state.businessId!,
-          mode: state.modelProfile!.id === KNOWLEDGE_SOL_PRODUCTION_PROFILE ? 'production' : 'active',
-          generationRemainingMs: state.budget!.generationRemaining(), attempts: state.budget!.attempts, maxAttempts: state.budget instanceof DurableKnowledgeBudget ? state.budget.maxAttempts : ANSWER_LIMITS.attempts }),
+        admit: admitReExtraction,
       } } : {}),
       generate: async (requestedStage, instruction, data, contract) => {
         // A re_extraction is a complete fresh extraction: same schema, effort
@@ -6142,6 +6150,10 @@ async function generateNativeKnowledgeContent(sessionId:string,options:any,suppo
         const wireData = stage === 'verification' && getConfiguredAiProvider() === 'openai' && !(state.budget instanceof DurableKnowledgeBudget)
           ? compactKnowledgeVerifierInput(data) : data;
         try {
+          if (requestedStage === 're_extraction' && durablePublication) {
+            state.repairedDurableOversizedEmpty = true;
+            if (!await knowledgeOwnershipCurrent() || admitReExtraction()) throw new Error('knowledge_durable_reextraction_unavailable');
+          }
           const profileOptions = knowledgeStageOptions(state.modelProfile!, requestedStage, modelBinding, Date.now() +
             (stage === 'extraction' ? accuracyFirstExtractionAllowance(state.budget!.generationRemaining(), state.budget!.nativeTiming?.policy)
               : Math.min((state.budget!.nativeTiming?.policy ?? ACCURACY_FIRST_POLICY).verificationMs, state.budget!.generationRemaining())));
@@ -6235,7 +6247,9 @@ export async function executeDurableKnowledgeTask(task: KnowledgeTask,
   const naturalEnabled = naturalRequested && !naturalBypassed;
   const state: KnowledgeTurnState = { nativeChannel: task.scope.channel, sessionId, ...(naturalBypassed ? { naturalBypassed: true } : {}),
     budget, businessId: task.scope.businessId, question: question, history: structuredClone([...task.input.history]),
-    durableCheckpoint: context.checkpoint, durableProgress: context.progress, durableCurrent: async () => !context.signal.aborted && budget.remaining() > 0 && await current(),
+    durableCheckpoint: context.checkpoint, durableProgress: context.progress, ownsDurableLease: context.ownsLease,
+    durableCurrent: async () => !context.signal.aborted && budget.remaining() > 0 && await current() &&
+      (!state.repairedDurableOversizedEmpty || await context.ownsLease?.() === true),
     naturalEnabled, naturalSinglePartial: process.env.ODINLINK_GROUNDED_NATURAL_SINGLE_PARTIAL === 'true', naturalTurnId: task.turnId };
   return withBusinessInformationTiming(() => requestSecurity.run(() => knowledgeTurnScope.run(state, async () => {
     requestSecurity.bind(sessionId);
@@ -6257,13 +6271,14 @@ export async function executeDurableKnowledgeTask(task: KnowledgeTask,
       if (!manifest?.units.length || !manifest.text.trim() || manifest.units.some(unit => unit.verification !== 'ENTAILED')) return null;
       const complete = completeKnowledgeManifest(manifest) && !manifest.qualifiedPartial && !manifest.sourceScopedPartial &&
         !manifest.sourceLimitations && !manifest.unresolvedRequirements && !manifest.obligationLimitations;
+      if (state.repairedDurableOversizedEmpty && !complete) return null;
       if (!complete && (!budget.publicationV2 || !publishableKnowledgeManifest(manifest, task.scope.businessId, budget))) return null;
       const sources = new Map<string, string>();
       for (const item of state.snapshot?.evidence || []) {
         if (sources.has(item.sourceId) && sources.get(item.sourceId) !== item.version) return null;
         sources.set(item.sourceId, item.version);
       }
-      const natural = await durableNaturalPublication({ state, manifest, budget, businessConfig, channel: task.scope.channel,
+      const natural = state.repairedDurableOversizedEmpty ? undefined : await durableNaturalPublication({ state, manifest, budget, businessConfig, channel: task.scope.channel,
         attemptsLeft: () => budget.maxAttempts - reservedAttempts, reserveAttempt });
       if (state.manifest !== manifest || state.freshnessFailure || !budget.remaining()) return null;
       if (natural && (!await knowledgeEvidenceCurrent() || state.manifest !== manifest || !await current())) return null;

@@ -12,6 +12,7 @@ import { boundedInteger, captureVerified, safeUnavailableKnowledge, resultDigest
 export type KnowledgeExecutor = (task: KnowledgeTask, context: Readonly<{
   signal: AbortSignal; expiresAt: number;
   progress?(stage: 'extraction' | 'verification' | null, labels?: readonly string[]): void;
+  ownsLease?(): Promise<boolean>;
   reserveModelAttempt(): Promise<void>;
   checkpoint(stage: Checkpoint): Promise<void>;
 }>) => Promise<VerifiedKnowledge | null>;
@@ -79,6 +80,12 @@ export class KnowledgeRunner {
         try {
           result = task.publicationV2 && (task.finalOnly || Date.now() >= deadlineAt) ? fallback()
             : await knowledgeOperation(executionSignal=>this.execute(task!, { signal: executionSignal, expiresAt: task!.expiresAt,
+              ownsLease: async () => {
+                if (executionSignal.aborted) return false;
+                const latest = await knowledgeOperation(() => this.repository.get(scope, taskId), { signal: executionSignal });
+                return !executionSignal.aborted && latest?.state === 'RUNNING' && latest.fence === token.fence &&
+                  latest.lease?.owner === token.owner && latest.lease.until > Date.now() && latest.expiresAt > Date.now();
+              },
               reserveModelAttempt: async () => {
                 if(executionSignal.aborted)throw new Error('knowledge_runner_stopped');
                 current();

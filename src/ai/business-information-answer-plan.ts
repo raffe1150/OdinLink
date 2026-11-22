@@ -283,7 +283,7 @@ export function answerEvidenceBindings(businessId: number, matches: readonly any
  * re-extraction; it never admits, repairs or re-reads a rejected proposal. */
 export type ReExtractionTally = { ambiguousConnective: number; citationOmitsQuantity: number; numericalExactness?: number; numericalRepresentation?: number };
 export type ReExtractionEvent = Readonly<{
-  trigger: 'none' | 'ambiguous_connective' | 'citation_omits_quantity' | 'both' | 'numerical_exactness' | 'numerical_representation' | 'other_rejection' | 'out_of_scope';
+  trigger: 'none' | 'ambiguous_connective' | 'citation_omits_quantity' | 'both' | 'numerical_exactness' | 'numerical_representation' | 'oversized_empty' | 'other_rejection' | 'out_of_scope';
   outcome: 'not_needed' | 'not_eligible' | 'skipped' | 'source_changed' | 'dispatched' | 'failed';
   skipReason?: string; firstPass: { proposed: number; parsed: number; rejected: number };
   replacement?: { proposed: number; parsed: number; rejected: number }; durationMs?: number; failureReason?: string }>;
@@ -630,7 +630,7 @@ export async function buildEvidenceFirstAnswer(input: {
    * At most ONE fresh, complete re-extraction after a narrowly classified
    * first-pass rejection. `admit` re-checks permit, budget and time immediately
    * before dispatch; `record` receives content-free telemetry. */
-  reExtraction?: { admit: () => string | null; record: (event: ReExtractionEvent) => void };
+  reExtraction?: { admit: () => string | null; record: (event: ReExtractionEvent) => void; durableOversizedEmpty?: true };
   generate: AnswerGenerator; current: () => Promise<boolean>;
 }): Promise<AnswerManifest> {
   const { language, budget } = input;
@@ -734,6 +734,7 @@ export async function buildEvidenceFirstAnswer(input: {
   let extractionIncomplete=false;
   let isolatedNumericalFacets: ReadonlySet<string> | undefined;
   let proposalParseComplete=false;
+  let repairedOversizedEmpty = false;
   let ownerProposalIndex: number | undefined;
   let documentaryInventoryIds: readonly string[] = [];
   let naturalProposal: NaturalProposal | null = null;
@@ -818,8 +819,13 @@ export async function buildEvidenceFirstAnswer(input: {
       ownerProposalIndex = raw.units.length;
       raw = { ...raw, units: [...raw.units, ownerApproval] };
     }
+    const durableOversizedEmpty = input.reExtraction?.durableOversizedEmpty === true && input.durablePartialPublication === true &&
+      input.businessId === 3 && result?.text.trimStart().startsWith('{') && result.text.trimEnd().endsWith('}') &&
+      raw.oversized === true && Array.isArray(raw.units) && raw.units.length === 0 &&
+      Object.keys(raw).length === 2 && extractionEvidence.length === input.evidence.length;
     const reExtractionScope = !!input.reExtraction && !ownerFirst && !ownerApproval && !catalogProposal && !cancellationProposals.length &&
-      !canonicalConfiguration && !literalSnapshot && !input.natural && !input.requireCompleteCoverage && !!input.foreground && !!budget.nativeTiming &&
+      !canonicalConfiguration && !literalSnapshot && !input.natural && !input.requireCompleteCoverage && !!input.foreground &&
+      (!!budget.nativeTiming || durableOversizedEmpty) &&
       requestedExtractionProtocol === 'v2' && verificationProtocol === 'source-exhaustive-v2' &&
       Number.isSafeInteger(input.businessId) && input.businessId! > 0 && extractionEvidence.every(e => e.businessId === input.businessId);
     const reExtractionTally: ReExtractionTally | undefined = reExtractionScope ? { ambiguousConnective: 0, citationOmitsQuantity: 0 } : undefined;
@@ -845,15 +851,14 @@ export async function buildEvidenceFirstAnswer(input: {
         isolatedNumericalFacets = new Set(missing.map(({ unit }: { unit: any }) => unit.facetIds[0]));
     }
     if (input.reExtraction && reExtractionTally) {
-      // Narrow, one-shot recovery. Only the canary's own v2 documentary path is
-      // in scope; owner, catalog, cancellation, canonical, literal, natural and
-      // durable paths are excluded above. Original proposals are DISCARDED; the
-      // replacement is a complete fresh inventory under every unchanged gate.
+      // One fresh inventory under the original gates. Durable eligibility is
+      // limited to the oversized-empty response above.
       const proposedCount = Array.isArray(raw.units) ? raw.units.length : 0;
       const firstPass = { proposed: proposedCount, parsed: proposed.units.length, rejected: Math.max(0, proposedCount - proposed.units.length) };
       const eligible = reExtractionTally.ambiguousConnective + reExtractionTally.citationOmitsQuantity + (reExtractionTally.numericalExactness ?? 0) +
         (reExtractionTally.numericalRepresentation ?? 0);
-      const trigger = !firstPass.rejected ? 'none' as const : !Array.isArray(raw.units) || raw.oversized !== false || eligible !== firstPass.rejected ? 'other_rejection' as const :
+      const trigger = durableOversizedEmpty ? 'oversized_empty' as const :
+        !firstPass.rejected ? 'none' as const : !Array.isArray(raw.units) || raw.oversized !== false || eligible !== firstPass.rejected ? 'other_rejection' as const :
         reExtractionTally.numericalExactness ? 'numerical_exactness' as const :
         reExtractionTally.numericalRepresentation ? 'numerical_representation' as const :
         reExtractionTally.ambiguousConnective && reExtractionTally.citationOmitsQuantity ? 'both' as const :
@@ -875,6 +880,7 @@ export async function buildEvidenceFirstAnswer(input: {
           if (late) input.reExtraction.record({ trigger, outcome: 'skipped', skipReason: late, firstPass });
           else {
             const guidance = [
+              durableOversizedEmpty ? 'RE-EXTRACTION: Reassess the whole question against every supplied evidence item. Count the distinct material facts needed to answer every requested part, including all applicable conditions and qualifications. Avoid duplicate propositions and unrelated detail. If the complete inventory still exceeds the existing unit limit, return oversized with an empty unit list.' : '',
               reExtractionTally.ambiguousConnective ? REEXTRACTION_CONNECTIVE_GUIDANCE : '',
               reExtractionTally.citationOmitsQuantity ? REEXTRACTION_CITATION_GUIDANCE : '',
               reExtractionTally.numericalExactness ? REEXTRACTION_EXACTNESS_GUIDANCE : '',
@@ -893,7 +899,13 @@ export async function buildEvidenceFirstAnswer(input: {
               input.reExtraction.record({ trigger, outcome: 'failed', firstPass, durationMs: Date.now() - started, failureReason: second.structuredFailure || 'MALFORMED_JSON' });
               return empty('UNAVAILABLE', second.structuredFailure || 'MALFORMED_JSON');
             }
+            if (durableOversizedEmpty && (!second.text.trimStart().startsWith('{') || !second.text.trimEnd().endsWith('}') || !object(replacementRaw) ||
+                typeof replacementRaw.oversized !== 'boolean' || !Array.isArray(replacementRaw.units) || Object.keys(replacementRaw).length !== 2)) {
+              input.reExtraction.record({ trigger, outcome: 'failed', firstPass, durationMs: Date.now() - started, failureReason: 'INVALID_FIELDS' });
+              return empty('UNAVAILABLE', 'INVALID_FIELDS');
+            }
             raw = replacementRaw;
+            repairedOversizedEmpty = durableOversizedEmpty;
             isolatedNumericalFacets = undefined;
             proposed = parseAnswerUnits(raw, facets, availableEvidence, language, diagnostic, 'quotation',
               {businessId:input.businessId,question:input.question,language},
@@ -933,6 +945,7 @@ export async function buildEvidenceFirstAnswer(input: {
   if (!proposed.units.length) return empty('UNAVAILABLE','NO_PARSED_UNITS');
   if (!budget.remaining() || !await input.current()) return rejectProposals(budget.remaining()?'CONTEXT_INVALID':'DEADLINE');
   availableEvidence = await revalidate();
+  if (repairedOversizedEmpty && availableEvidence.length !== input.evidence.length) return rejectProposals('SOURCE_INVALID');
   proposed.units = proposed.units.filter(u => {
     const valid=u.evidenceRefs.every(r=>availableEvidence.some(e=>e.id===r.evidenceId));
     if(!valid) {
@@ -1196,7 +1209,8 @@ export async function buildEvidenceFirstAnswer(input: {
   const sourceDetail = isSourceExhaustiveProtocol(verificationProtocol)
     ? assessSourceCoverageDetailed(parsed, facets, proposed.units, availableEvidence, input.businessId, verificationProtocol) : undefined;
   const sourceAssessment = sourceDetail?.assessment;
-  if (sourceAssessment?.state === 'DENIED' || (ownerProposalIndex !== undefined && sourceAssessment?.state !== 'COMPLETE')) {
+  if (sourceAssessment?.state === 'DENIED' ||
+    ((ownerProposalIndex !== undefined || repairedOversizedEmpty) && sourceAssessment?.state !== 'COMPLETE')) {
     diagnostic({ stage: 'verification', reason: 'INVALID_COVERAGE', ...sourceCoverageField(() => sourceDetail &&
       (sourceDetail.assessment.state === 'DENIED' ? sourceDetail.record : withOwnerCompleteVeto(sourceDetail.record))) });
     return empty('UNAVAILABLE', 'INVALID_COVERAGE');
@@ -1206,6 +1220,7 @@ export async function buildEvidenceFirstAnswer(input: {
   // the native publication guard. This grants no authority to send the manifest.
   const deferFreshness=input.finalPublicationRevalidates && !input.natural && !optionalCompositionAffordable(budget);
   const manifestEvidence=deferFreshness ? availableEvidence : await revalidate();
+  if (repairedOversizedEmpty && manifestEvidence.length !== input.evidence.length) return rejectProposals('SOURCE_INVALID');
   if (ownerProposalIndex !== undefined && (manifestEvidence.length !== input.evidence.length ||
       !completeKnowledgeManifest({ ...empty('UNAVAILABLE'), units: verified, outcomes })))
     return rejectProposals('INVALID_COVERAGE');
@@ -1217,6 +1232,7 @@ export async function buildEvidenceFirstAnswer(input: {
     uncertaintyReferences: uncertaintyReferences(input.question, language, facets, outcomes,
       text => Boolean(input.languageSafe?.({ ...verified[0], text })),[...verified.map(u=>u.text),...manifestEvidence.map(e=>e.text)]),
     presentation: Object.freeze({ unitIds: Object.freeze(verified.map(u => u.id)), prefix: 'none' as const, addition: false }) }), manifestEvidence,diagnostic);
+  if (repairedOversizedEmpty && !completeKnowledgeManifest(manifest)) return rejectProposals('INVALID_COVERAGE');
   if (sourceAssessment?.state === 'SCOPED_PARTIAL') {
     // New opt-in permission. Never reuse the diagnostic witness as a certificate,
     // modify legacy coverage, or fall through to another partial-authority lane.
