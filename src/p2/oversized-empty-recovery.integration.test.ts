@@ -36,6 +36,7 @@ type Mode = 'ok' | 'ordinary-empty' | 'malformed' | 'refused' | 'truncated' | 'r
   | 'changed-chunk' | 'late-verification';
 const oversizedEmpty = { oversized: true, units: [] };
 const questionSv = 'Jag ska besöka AdMotion Studio för första gången. Hur tidigt bör jag komma och hur hittar jag till entrén?';
+const arrivalPolicyQuestionSv = questionSv + ' Är det ett krav att komma tidigare eller bara en rekommendation?';
 const factsSv = [
   'Förstagångsbesökare rekommenderas att komma cirka 10 minuter före sin bokade tid.',
   'Entrén ligger på innergården.',
@@ -69,7 +70,7 @@ const sixFirstVisitFacts = [...capturedFacts.slice(0, 3), ...[
 ].map((text, index) => ({ quote: capturedFacts[3].quote, text, modality: index === 2 ? 'descriptive' : 'required' }))];
 type Entry = readonly [Channel, SourceLanguage, string, readonly string[]];
 type ReviewFault = 'unexpected-reviewed-id' | 'missing-reviewed-id' | 'duplicate-reviewed-id';
-type PartialCase = ReviewFault | 'stale-complete' | 'incident' | 'optional' | 'condition' | 'conflict' | 'number' | 'citation' | 'stale' | 'independent' | 'linked'
+type PartialCase = ReviewFault | 'arrival-policy' | 'stale-complete' | 'incident' | 'optional' | 'condition' | 'conflict' | 'number' | 'citation' | 'stale' | 'independent' | 'linked'
   | 'compound' | 'compound-after-repair' | 'missing-records' | 'unknown-dependency' | 'linked-condition' | 'affected-unit'
   | 'forged-evidence' | 'inexact-quote' | 'reused-unit-quote' | 'wrong-aspect' | 'incomplete-inventory';
 type PartialFixture = { kind: PartialCase; missingFact?: string };
@@ -127,6 +128,20 @@ function verifier(data: any, mode: Mode) {
 
 function partialVerifier(data: any, { kind, missingFact }: PartialFixture) {
   const verdict = verifier(data, 'ok');
+  if (kind === 'arrival-policy') {
+    assert.deepEqual(data.facets.map((f: any) => f.questionType), ['description', 'description', 'requirement']);
+    assert.equal(data.units.length, 6);
+    return {
+      ...verdict,
+      decisions: verdict.decisions.map((decision, index) => ({ ...decision,
+        negativeAbsence: data.units[index].negation, explicitAbsenceEvidence: data.units[index].negation })),
+      coverage: verdict.coverage.map(row => {
+        const ids = data.units.filter((u: any) => u.facetIds.includes(row.facetId)).map((u: any) => u.id);
+        return { ...row, materialUnitIds: ids, obligations: row.obligations.map((o: any) => ({ ...o, unitIds: ids })) };
+      }),
+      sourceCoverage: { ...verdict.sourceCoverage, omissions: { complete: true, records: [] } },
+    };
+  }
   if (kind === 'optional' || kind === 'stale-complete' || kind.endsWith('-reviewed-id')) {
     // The PDF also recommends reading the studio information before visiting.
     // The fixture verifier judges that unrequested advice independent of the
@@ -306,8 +321,12 @@ test('managed durable oversized-empty recovery through native intake and Postgre
           assert.ok(item, 'original source wording must appear on the selected wire');
           const quote = item.text.match(fact.quote)[0];
           if (fact.quote === capturedFacts[3].quote) assert.match(quote, /andra\nvåningen/);
-          return { facetIds: data.facets.map((f: any) => f.id), subject: 'AdMotion Studio', predicate: 'besöksinformation',
-            value: fact.text, modality: fact.modality, negation: false, scope: 'studiobesök', qualifiers: [], language,
+          const arrivalPolicy = partial?.kind === 'arrival-policy';
+          const requiredAbsence = arrivalPolicy && index === 1;
+          return { facetIds: arrivalPolicy ? [data.facets[index === 0 ? 0 : index === 1 ? 2 : 1].id] : data.facets.map((f: any) => f.id),
+            subject: 'AdMotion Studio', predicate: 'besöksinformation',
+            value: fact.text, modality: requiredAbsence ? 'required' : fact.modality, negation: requiredAbsence,
+            scope: 'studiobesök', qualifiers: [], language,
             text: partial?.kind === 'number' && index === 0 ? fact.text.replace('10', '99')
               : partial?.kind === 'condition' && index === 2 ? 'Studions entré ligger på innergården.' : fact.text,
             evidenceRefs: [{ evidenceId: item.id, exactQuote: partial?.kind === 'citation' && index === 0 ? quote + ' Ändrat.' : quote }] };
@@ -617,6 +636,21 @@ test('managed durable oversized-empty recovery through native intake and Postgre
       assert.equal(result.posts.length, 1);
       for (const fact of sixFirstVisitFacts) assert.ok(result.posts[0].includes(fact.text), result.posts[0]);
       assert.equal(result.summaries[0]?.semanticVerifiedUnits, 6);
+      const accepted = result.decisions.find(event => event.reason === 'SOURCE_COVERAGE_ACCEPTED');
+      assert.equal(accepted?.sourceCoverage.state, 'COMPLETE');
+      assert.deepEqual(accepted.sourceCoverage.evidenceInventory, { expected: 5, reviewed: 5, missing: 0, unexpected: 0, duplicate: 0 });
+    });
+  }
+
+  for (const channel of ['telegram', 'whatsapp', 'instagram', 'messenger'] as const) {
+    await t.test(`Swedish ${channel}: self-contained arrival-policy incident reaches Sol directly`, async st => {
+      const result = await run(st, [channel, 'sv', arrivalPolicyQuestionSv, factsSv], 'ok', 'foreground', { kind: 'arrival-policy' });
+      assert.deepEqual(result.failures, []);
+      assert.deepEqual(result.calls, ['extraction', 'verification']);
+      assert.deepEqual(result.quotes, result.calls);
+      assert.equal(result.posts.length, 1);
+      for (const fact of sixFirstVisitFacts) assert.ok(result.posts[0].includes(fact.text), result.posts[0]);
+      assert.ok(result.decisions.some(event => event.reason === 'LITERAL_REQUEST_DIRECT'));
       const accepted = result.decisions.find(event => event.reason === 'SOURCE_COVERAGE_ACCEPTED');
       assert.equal(accepted?.sourceCoverage.state, 'COMPLETE');
       assert.deepEqual(accepted.sourceCoverage.evidenceInventory, { expected: 5, reviewed: 5, missing: 0, unexpected: 0, duplicate: 0 });

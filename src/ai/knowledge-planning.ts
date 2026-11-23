@@ -357,9 +357,15 @@ const coordinatedQuestionBoundary = new RegExp([
   String.raw`(?:[,،]\s*|\s+)و\s*(?=آیا(?![\p{L}\p{M}]))`,
   String.raw`(?:[,،]\s*|\s+)و\s*(?=هل(?![\p{L}\p{M}]))`,
 ].join('|'), 'giu');
+// In a visit checklist with several explicit questions, Swedish "och hur"
+// introduces another requested answer. Keep single-question routing unchanged.
+const visitChecklistQuestionBoundary = new RegExp([
+  coordinatedQuestionBoundary.source,
+  String.raw`\s+och\s+(?=hur\s+(?:hittar|tar)\s+(?:jag|vi|man)(?![\p{L}\p{M}]))`,
+].join('|'), 'giu');
 // A yes/no necessity question. Wh-questions ("how many minutes before must I…")
 // stay descriptive: they ask for the business fact, not a binary obligation.
-const necessityQuestion = /^(?:¿\s*)?(?:(?:do|does)\s+(?:i|we|one)\s+(?:need|have)\s+to|(?:must|need)\s+(?:i|we)|is\s+it\s+(?:necessary|required|mandatory)|(?:behöver|måste)\s+(?:jag|vi|man)|är\s+det\s+(?:nödvändigt|obligatoriskt)|(?:muss|müssen|brauche|brauchen)\s+(?:ich|wir|man)|ist\s+es\s+(?:nötig|notwendig|erforderlich|pflicht)|(?:necesito|necesitamos|debo|debemos|tengo\s+que|hay\s+que|es\s+(?:necesario|obligatorio)))(?![\p{L}\p{M}])|^آیا\s+(?:لازم|باید|ضروری|اجباری|الزامی)|^هل\s+(?:يجب|يلزم|أحتاج|احتاج|نحتاج|يتعين|عل[يىَّ]+|من\s+الضروري)/iu;
+const necessityQuestion = /^(?:¿\s*)?(?:(?:do|does)\s+(?:i|we|one)\s+(?:need|have)\s+to|(?:must|need)\s+(?:i|we)|is\s+it\s+(?:necessary|required|mandatory)|(?:behöver|måste)\s+(?:jag|vi|man)|är\s+det\s+(?:nödvändigt|obligatoriskt|ett\s+(?:krav|måste))|(?:muss|müssen|brauche|brauchen)\s+(?:ich|wir|man)|ist\s+es\s+(?:nötig|notwendig|erforderlich|pflicht)|(?:necesito|necesitamos|debo|debemos|tengo\s+que|hay\s+que|es\s+(?:necesario|obligatorio)))(?![\p{L}\p{M}])|^آیا\s+(?:لازم|باید|ضروری|اجباری|الزامی)|^هل\s+(?:يجب|يلزم|أحتاج|احتاج|نحتاج|يتعين|عل[يىَّ]+|من\s+الضروري)/iu;
 
 /** A visit-context sentence followed by two to four coordinated questions.
  * Keeps the full literal-container safety checks, then preserves each question
@@ -384,9 +390,10 @@ export function contextualCompoundInformationPlan(question: string, recognized: 
   const asked = rest.match(/[^?؟]+[?؟]/gu) || [];
   if (asked.join('') !== rest) return null;
   const spans: string[] = [];
+  const questionBoundary = asked.length > 1 ? visitChecklistQuestionBoundary : coordinatedQuestionBoundary;
   for (const part of asked) {
     let start = 0;
-    for (const boundary of part.matchAll(coordinatedQuestionBoundary)) {
+    for (const boundary of part.matchAll(questionBoundary)) {
       spans.push(part.slice(start, boundary.index).trim());
       start = boundary.index! + boundary[0].length;
     }

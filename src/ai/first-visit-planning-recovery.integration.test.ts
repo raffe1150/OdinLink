@@ -18,9 +18,10 @@ Object.assign(process.env, {
   ODINLINK_KNOWLEDGE_COMPACT_VERIFICATION: 'false', ODINLINK_KNOWLEDGE_CONFIG_PROPOSITIONS: 'source-partitioned-v1',
 });
 const { priority1hUnifiedEngineTestBoundary: b } = await import('../../server');
-type Fault = 'none' | 'rejected' | 'incomplete' | 'foreign' | 'revoked' | 'number' | 'scope' | 'required';
+type Fault = 'none' | 'rejected' | 'incomplete' | 'foreign' | 'revoked' | 'number' | 'scope' | 'required'
+  | 'context-timeout' | 'empty-plan';
 
-async function exercise(t: any, channel: IncidentChannel, spec: typeof firstVisitCases[number], fault: Fault = 'none', realTimer = false) {
+async function exercise(t: any, channel: IncidentChannel, spec: readonly [string, string, string], fault: Fault = 'none', realTimer = false) {
   b.reset();
   t.after(() => b.reset());
   for (const method of ['log', 'info', 'warn', 'error'] as const) t.mock.method(console, method, () => {});
@@ -35,7 +36,7 @@ async function exercise(t: any, channel: IncidentChannel, spec: typeof firstVisi
     await storage.replaceChunks(tenant, `arrival-${tenant}`, [{ chunkIndex: 0, content, metadata: { source: 'document', page: 1 } }]);
   }
   const stages: string[] = [], decisions: any[] = [], inputs: any[] = [], replies: string[] = [], providerErrors: string[] = [];
-  let plannerCalls = 0, actions = 0, aborted = false;
+  let plannerCalls = 0, actions = 0, aborted = false, retrieved = 0;
   const forbidden = async () => { actions++; assert.fail('No booking/calendar/database action is authorized'); };
   t.mock.method(globalThis, 'fetch', async (input: any, options: any) => {
     replies.push(interceptedIncidentSend(input, options));
@@ -47,8 +48,11 @@ async function exercise(t: any, channel: IncidentChannel, spec: typeof firstVisi
     knowledgeSourceLanguages: async id => { assert.equal(id, 77); return fault === 'foreign' ? [] : ['sv']; },
     knowledgeSearch: async (id, q, limit) => {
       assert.equal(id, 77);
-      return fault === 'foreign' ? [{ businessId: 88, sourceId: 'arrival-88', text: 'FOREIGN_SOURCE_SENTINEL: arrive 99 minutes early.',
-        score: 1, metadata: { source: 'document' } }] : service.search(id, q, limit);
+      if (fault === 'foreign') return [{ businessId: 88, sourceId: 'arrival-88', text: 'FOREIGN_SOURCE_SENTINEL: arrive 99 minutes early.',
+        score: 1, metadata: { source: 'document' } }];
+      const matches = await service.search(id, q, limit);
+      retrieved += matches.length;
+      return matches;
     },
     semanticKnowledgeSearchQueries: async () => [],
     completeKnowledgeCorpus: async (id, matches, options, mode) => fault === 'foreign' ? null : service.completeSmallCorpus(id, matches, options, mode),
@@ -63,12 +67,18 @@ async function exercise(t: any, channel: IncidentChannel, spec: typeof firstVisi
       try {
         if (request.systemInstruction.includes('retrieval query planner')) {
           plannerCalls++;
+          if (fault === 'empty-plan') return { functionCalls: [], text: JSON.stringify({
+            canonicalMeaning: 'first visit arrival time', queries: ['första gången'], requestedFacets: [],
+            queryLanguages: [{ query: 'första gången', language: 'sv' }], requestKind: 'BUSINESS_INFORMATION',
+            referenceResolution: 'NOT_REQUIRED',
+          }) };
           if (realTimer) return new Promise((_resolve, reject) => {
             assert.ok(request.signal);
             request.signal.addEventListener('abort', () => { aborted = true; reject(request.signal!.reason); }, { once: true });
           });
           throw new AiReliabilityError('TIMEOUT', 'SYNTHETIC forced planner timeout');
         }
+        assert.ok(!['context-timeout', 'empty-plan'].includes(fault), 'No factual provider request without recovered obligations');
         const data = JSON.parse(request.messages[0].content);
         assert.equal(data.question, normalizedQuestion, 'Only the existing channel punctuation normalization may change the question');
         assert.deepEqual(request.tools, []);
@@ -120,6 +130,16 @@ async function exercise(t: any, channel: IncidentChannel, spec: typeof firstVisi
   assert.equal(plannerCalls, 1, 'Exercise forced planner timeout, not a pre-supplied facet or direct-plan shortcut');
   assert.equal(actions, 0);
   assert.equal(replies.length, 1);
+  if (fault === 'context-timeout' || fault === 'empty-plan') {
+    assert.deepEqual(stages, []);
+    assert.ok(!decisions.some(e => e.reason === 'LITERAL_REQUEST_FALLBACK'));
+    assert.doesNotMatch(replies[0], /10|recommended|rekommenderas/u);
+    if (fault === 'empty-plan') {
+      assert.ok(retrieved > 0, 'Available evidence alone does not authorize a reply');
+      assert.ok(decisions.some(e => e.stage === 'planning' && e.reason === 'INVALID_FIELDS'));
+    } else assert.ok(decisions.some(e => e.stage === 'planning' && e.reason === 'DEADLINE'));
+    return;
+  }
   assert.ok(decisions.some(e => e.stage === 'planning' && e.reason === 'DEADLINE'));
   assert.ok(decisions.some(e => e.stage === 'planning' && e.reason === 'LITERAL_REQUEST_FALLBACK'), 'The timeout must recover a full-question facet');
   const publication = decisions.filter(e => e.stage === 'publication').at(-1);
@@ -152,3 +172,7 @@ for (const channel of incidentChannels) for (const spec of firstVisitCases)
 test('SYNTHETIC WhatsApp exact incident recovers after the real 2500ms abort boundary', t => exercise(t, 'whatsapp', firstVisitCases[0], 'none', true));
 for (const fault of ['rejected', 'incomplete', 'foreign', 'revoked', 'number', 'scope', 'required'] as const)
   test(`SYNTHETIC recovered WhatsApp request remains fail-closed: ${fault}`, t => exercise(t, 'whatsapp', firstVisitCases[0], fault));
+test('planner timeout cannot recover a previous-turn location with literal planning', t =>
+  exercise(t, 'telegram', ['sv', 'Jag kommer för första gången. Hur tidigt ska jag vara där vid den entré vi pratade om?', ''], 'context-timeout'));
+test('empty business plan with available evidence cannot dispatch extraction or publish facts', t =>
+  exercise(t, 'whatsapp', firstVisitCases[0], 'empty-plan'));

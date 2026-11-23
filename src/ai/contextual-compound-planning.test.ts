@@ -36,6 +36,31 @@ test('single contextual question keeps the existing whole-question literal conta
   const q = "I'm coming for the first time. How many minutes before my appointment should I arrive?";
   assert.deepEqual(shape(q), [['description', 'customer request', [['description', q]]]]);
 });
+test('Swedish arrival-policy complements preserve arrival, entrance and rule obligations', () => {
+  const context = 'Jag ska besöka AdMotion Studio för första gången.';
+  const short = `${context} Hur tidigt bör jag komma och hur hittar jag till entrén?`;
+  assert.deepEqual(shape(short), [['description', 'customer request', [['description', short]]]]);
+  for (const policy of [
+    'Är det ett krav att komma tidigare eller bara en rekommendation?',
+    'Är det obligatoriskt att anlända i förväg?',
+    'Är det nödvändigt att vara på plats före min bokade tid?',
+  ]) {
+    const question = `${short} ${policy}`;
+    const plan = wholeQuestionInformationPlan(question, true, false, []);
+    assert.equal(plan?.canonicalMeaning, question);
+    assert.deepEqual(shape(question), [
+      ['description', context, [['description', 'Hur tidigt bör jag komma']]],
+      ['description', context, [['description', 'hur hittar jag till entrén?']]],
+      ['requirement', context, [['requirement', policy]]],
+    ]);
+    assert.equal(wholeQuestionInformationPlan(question, true, true, []), null, 'an upstream reference veto still applies');
+  }
+  for (const policy of [
+    'Är det ett krav?',
+    'Är det ett krav att komma dit tidigare?',
+    'Är det obligatoriskt att komma till den entré vi talade om?',
+  ]) assert.equal(shape(`${short} ${policy}`), undefined, policy);
+});
 test('safety: references, actions, oversize and non-question tails are never decomposed', () => {
   for (const q of [
     "I'm coming for the first time. Should I bring it there, and do I need to pay?",                // external reference
