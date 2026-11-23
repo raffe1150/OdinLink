@@ -4,7 +4,7 @@ import { knowledgeStructuredOutput } from './knowledge-answer-protocol';
 import { isSourceExhaustiveProtocol, SOURCE_EXHAUSTIVE_V2_PROTOCOL } from './source-exhaustive-coverage';
 import type { UnifiedAiGenerationRequest } from './providers/provider';
 import { managedKnowledgeDefault } from './model-routing';
-import { ACCURACY_FIRST_POLICY, knowledgeStageCapMs } from './knowledge-timing-policy';
+import { ACCURACY_FIRST_POLICY, durableStageCapMs, knowledgeStageCapMs } from './knowledge-timing-policy';
 
 export const KNOWLEDGE_SOL_PROFILE = 'sol-low-v1' as const;
 /** Extraction-only canary: Sol for extraction and one budget-owned re_extraction;
@@ -119,7 +119,8 @@ export function sentEvidenceCurrent(sent: readonly KnowledgeRequestEvidence[], c
 }
 type Selection = { binding: KnowledgeModelBinding; owner?: Owner; current?: CurrentCheck; used: Set<Stage>; settled: Set<Stage>; failed: boolean;
   /** Stages this profile dispatches on Sol through owner permits; captured once. */ managed: ReadonlySet<Stage>;
-  /** Captured verifier protocol; the Sol verifier schema must match it exactly. */ verificationProtocol: string };
+  /** Captured verifier protocol; the Sol verifier schema must match it exactly. */ verificationProtocol: string;
+  /** Captured for the durable publication-v2 scope only: the sole selection that may carry a durable stage cap. */ durable?: true };
 const LEGACY_STAGES: ReadonlySet<Stage> = new Set(['extraction', 'verification']);
 const CANARY_STAGES: ReadonlySet<Stage> = new Set(['extraction', 're_extraction']);
 const profiles = new WeakMap<KnowledgeModelProfile, Selection>();
@@ -213,7 +214,7 @@ function captureSolProduction(input: Parameters<typeof captureKnowledgeModelProf
   const profile: KnowledgeModelProfile = Object.freeze({ id: KNOWLEDGE_SOL_PRODUCTION_PROFILE });
   profiles.set(profile, { binding: Object.freeze({ businessId: input.businessId, turnId: input.turnId, requestKey: input.requestKey }), owner,
     current: input.current, used: new Set(), settled: new Set(), failed: false, managed: PRODUCTION_STAGES,
-    verificationProtocol: input.verificationProtocol });
+    verificationProtocol: input.verificationProtocol, ...(durableEligible ? { durable: true as const } : {}) });
   return profile;
 }
 /** Stages a captured profile dispatches on Sol (content-free diagnostics). */
@@ -241,9 +242,11 @@ export function knowledgeReExtractionAvailable(profile: KnowledgeModelProfile | 
   return !!selection && selection.managed.has('re_extraction') && !selection.failed && selection.settled.has('extraction') && !selection.used.has('re_extraction');
 }
 export type KnowledgeExecutionPermit = Readonly<{ profile: SolProfile; stage: Stage }>;
-type Permit = { selection: Selection; stage: Stage; deadlineAt: number; attempted: boolean };
+type Permit = { selection: Selection; stage: Stage; deadlineAt: number; attempted: boolean; stageCapMs?: number };
 const permits = new WeakMap<KnowledgeExecutionPermit, Permit>();
-export function knowledgeStageOptions(profile: KnowledgeModelProfile, stage: string, binding: KnowledgeModelBinding, deadlineAt: number):
+/** stageCapMs: durable-only per-request cap (see DURABLE_EXTENDED_STAGE_TIMING). Accepted only for a durable Sol
+ * selection and only with the exact durable cap of that stage; the absolute deadlineAt still bounds it. */
+export function knowledgeStageOptions(profile: KnowledgeModelProfile, stage: string, binding: KnowledgeModelBinding, deadlineAt: number, stageCapMs?: number):
   Partial<Pick<UnifiedAiGenerationRequest, 'model' | 'reasoningEffort' | 'knowledgeExecution'>> {
   if (profile.id === 'default' || (stage !== 'extraction' && stage !== 'verification' && stage !== 're_extraction')) return {};
   const selection = profiles.get(profile);
@@ -256,9 +259,10 @@ export function knowledgeStageOptions(profile: KnowledgeModelProfile, stage: str
   check(!selection.failed && !selection.used.has(stage as Stage), 'stage_already_closed');
   check(stage !== 're_extraction' || selection.settled.has('extraction'), 're_extraction_without_extraction');
   check(Number.isFinite(deadlineAt) && deadlineAt > Date.now(), 'deadline');
+  check(stageCapMs === undefined || selection.durable === true && stageCapMs === durableStageCapMs(stage), 'stage_cap');
   selection.used.add(stage as Stage);
   const permit = Object.freeze({ profile: profile.id, stage: stage as Stage });
-  permits.set(permit, { selection, stage, deadlineAt, attempted: false });
+  permits.set(permit, { selection, stage, deadlineAt, attempted: false, ...(stageCapMs !== undefined ? { stageCapMs } : {}) });
   return { model: 'gpt-6.1-sol', reasoningEffort: 'low', knowledgeExecution: permit };
 }
 function validRequest(request: UnifiedAiGenerationRequest, state: Permit) {
@@ -330,7 +334,8 @@ export async function executeKnowledgeGeneration<T>(request: UnifiedAiGeneration
     check(!owner.providerProjectId || !process.env.OPENAI_PROJECT_ID || process.env.OPENAI_PROJECT_ID === owner.providerProjectId, 'provider_project_mismatch');
     check(request.signal && !request.signal.aborted, 'cancellation');
     // Production: 20000 / 19999 (accuracy-first-v1). Only an active experiment timing scope raises the cap.
-    const deadlineAt = Math.min(state.deadlineAt, Date.now() + knowledgeStageCapMs(state.stage));
+    // Durable extended tasks carry their own validated stage cap; everything else keeps the foreground policy cap.
+    const deadlineAt = Math.min(state.deadlineAt, Date.now() + (state.stageCapMs ?? knowledgeStageCapMs(state.stage)));
     const dispatchFloorMs = state.stage === 'verification' ? ACCURACY_FIRST_POLICY.verificationDispatchMs : 1;
     check(deadlineAt - Date.now() >= dispatchFloorMs, 'dispatch_allowance');
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(Math.max(1, deadlineAt - Date.now()))]);

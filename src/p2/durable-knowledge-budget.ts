@@ -1,6 +1,7 @@
 import { InformationBudget } from '../ai/business-information-answer-plan';
 import { boundedInteger, type KnowledgeTask } from './knowledge-lifecycle';
 import { knowledgeExecutionDeadline } from './knowledge-operation';
+import { DURABLE_EXTENDED_STAGE_TIMING, type DurableStageTiming } from '../ai/knowledge-timing-policy';
 
 /** Explicit inactive task budget. The foreground InformationBudget stays 20s.
  * No queue/retry/recovery can reset acceptedAt or the original absolute expiry.
@@ -11,6 +12,9 @@ export class DurableKnowledgeBudget extends InformationBudget {
   readonly executionDeadlineAt:number;
   readonly publicationV2: boolean;
   readonly maxAttempts: number;
+  /** Durable-only stage timing; absent (foreground 20 s / 19.999 s caps) unless this is a publication-v2 task
+   * admitted with exactly the allowlisted extended window. Derived from persisted task fields only. */
+  readonly stageTiming?: DurableStageTiming;
   constructor(task: KnowledgeTask, readonly signal: AbortSignal, readonly reserve: () => Promise<void>) {
     super();
     boundedInteger(task.acceptedAt, 1, Number.MAX_SAFE_INTEGER);
@@ -20,6 +24,7 @@ export class DurableKnowledgeBudget extends InformationBudget {
     this.publicationV2 = task.publicationV2 === true && task.scope.businessId === 3;
     this.maxAttempts = this.publicationV2 ? boundedInteger(task.maxModelAttempts, 4, 5) : Math.min(task.maxModelAttempts, 4);
     this.attempts = boundedInteger(task.modelAttempts, 0, 8);
+    if (this.publicationV2 && task.expiresAt - task.acceptedAt === DURABLE_EXTENDED_STAGE_TIMING.windowMs) this.stageTiming = DURABLE_EXTENDED_STAGE_TIMING;
   }
   override attempt() {
     if (!this.remaining() || this.attempts >= this.maxAttempts) throw new Error('information_budget_exhausted');

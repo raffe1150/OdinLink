@@ -31,7 +31,7 @@ const { executeDurableKnowledgeTask, priority1hUnifiedEngineTestBoundary: b } = 
 const accounts = { telegram: '123456', whatsapp: '10001', instagram: '30001', messenger: '40001' };
 type Channel = keyof typeof accounts;
 type Mode = 'ok' | 'ordinary-empty' | 'malformed' | 'refused' | 'truncated' | 'repeat' | 'number' | 'citation' | 'repair-refused' | 'repair-incomplete'
-  | 'coverage' | 'verdict' | 'changed' | 'changed-after-hold' | 'denied' | 'time' | 'expired' | 'attempts'
+  | 'coverage' | 'verdict' | 'changed' | 'changed-after-hold' | 'denied' | 'time' | 'repair-time' | 'expired' | 'attempts'
   | 'superseded' | 'wrong-binding' | 'foreign-evidence' | 'wrong-conversation' | 'fenced-after-hold' | 'other-protocol'
   | 'changed-chunk' | 'late-verification';
 const oversizedEmpty = { oversized: true, units: [] };
@@ -460,7 +460,11 @@ test('managed durable oversized-empty recovery through native intake and Postgre
     assert.equal(accepted.knowledge_max_models, 4);
     assert.equal(Date.parse(accepted.knowledge_expires_at) - Date.parse(accepted.knowledge_accepted_at), 75_000);
     // Age a fixture only in this disposable cluster. Preserve its 75-second window.
-    const ageSeconds = mode === 'time' ? 45 : mode === 'expired' ? 76 : variant === 'lexical' && mode === 'ok' ? 23 : 0;
+    // Durable extended stage budget: generation remaining = 75 - age - 15 (lifecycle) - 1.5 (publication) s;
+    // extraction allowance = min(30, remaining - 22). 'time' (45 s) leaves ~13.5 s: no extraction can keep the
+    // verifier's reserve, so nothing is dispatched or reserved. 'repair-time' (32 s) leaves ~26.5 s: extraction gets
+    // ~4.5 s, then re_extraction (needs >= 8 s after the same reserve) is skipped for the deadline.
+    const ageSeconds = mode === 'time' ? 45 : mode === 'repair-time' ? 32 : mode === 'expired' ? 76 : variant === 'lexical' && mode === 'ok' ? 23 : 0;
     if (ageSeconds) pg.sql(`SET session_replication_role = replica;
       UPDATE odin_tasks SET knowledge_expires_at = statement_timestamp() + interval '${75 - ageSeconds} seconds',
       knowledge_accepted_at = statement_timestamp() - interval '${ageSeconds} seconds' WHERE id = '${taskId}';`);
@@ -545,7 +549,7 @@ test('managed durable oversized-empty recovery through native intake and Postgre
     assert.deepEqual(result.posts, [safeUnavailableKnowledge('sv').text]);
     assert.deepEqual(result.outbox, ['SENT']);
   });
-  for (const mode of ['changed-chunk', 'time'] as const) await t.test(`production parity: ${mode} blocks repair on the captured corpus`, async st => {
+  for (const mode of ['changed-chunk', 'repair-time'] as const) await t.test(`production parity: ${mode} blocks repair on the captured corpus`, async st => {
     const result = await run(st, cases[0], mode, 'lexical');
     assert.deepEqual(result.calls, ['extraction']);
     assert.deepEqual(result.quotes, result.calls);
@@ -554,8 +558,8 @@ test('managed durable oversized-empty recovery through native intake and Postgre
     if (process.env.ODINLINK_PARITY_UNPATCHED !== '1') {
       const repair = result.summaries.find(event => event.reExtraction)?.reExtraction;
       assert.equal(repair?.trigger, 'oversized_empty');
-      assert.equal(repair?.outcome, mode === 'time' ? 'skipped' : 'source_changed');
-      if (mode === 'time') assert.equal(repair.skipReason, 'deadline');
+      assert.equal(repair?.outcome, mode === 'repair-time' ? 'skipped' : 'source_changed');
+      if (mode === 'repair-time') assert.equal(repair.skipReason, 'deadline');
     }
   });
   await t.test('production parity: verifier allowance lost after hold suppresses provider dispatch and publishes safe final', async st => {
@@ -746,10 +750,10 @@ test('managed durable oversized-empty recovery through native intake and Postgre
   });
 
   const oneCall = ['ordinary-empty', 'malformed', 'refused', 'truncated', 'changed', 'changed-after-hold',
-    'denied', 'time', 'attempts', 'superseded', 'wrong-binding', 'fenced-after-hold', 'other-protocol'] as const;
+    'denied', 'repair-time', 'attempts', 'superseded', 'wrong-binding', 'fenced-after-hold', 'other-protocol'] as const;
   const twoCalls = ['repeat', 'number', 'citation', 'repair-refused', 'repair-incomplete'] as const;
   const threeCalls = ['coverage', 'verdict'] as const;
-  const noCalls = ['expired', 'foreign-evidence', 'wrong-conversation'] as const;
+  const noCalls = ['expired', 'foreign-evidence', 'wrong-conversation', 'time'] as const;
   for (const [modes, expected] of [[oneCall, ['extraction']], [twoCalls, ['extraction', 're_extraction']],
     [threeCalls, ['extraction', 're_extraction', 'verification']], [noCalls, []]] as const) {
     for (const mode of modes) await t.test(`${mode} cannot publish a factual result or dispatch an extra call`, async st => {

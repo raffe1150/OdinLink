@@ -46,12 +46,14 @@ export function extractionReasonCounts(events: readonly KnowledgeDecision[]): Re
 
 /** Host admission check, re-evaluated immediately before the re_extraction dispatch. */
 export function reExtractionAdmission(input: { profile: KnowledgeModelProfile; businessId: number; mode: 'active' | 'shadow' | 'production';
-  generationRemainingMs: number; attempts: number; maxAttempts: number; env?: NodeJS.ProcessEnv }): string | null {
+  generationRemainingMs: number; attempts: number; maxAttempts: number; env?: NodeJS.ProcessEnv;
+  /** The allowance the re_extraction dispatch will actually receive (durable extended tasks pass their own). */
+  extractionAllowance?: (generationRemainingMs: number) => number }): string | null {
   // A flag/routing change mid-turn stops NEW Sol spending; it never switches model.
   if (input.mode === 'production' ? !managedKnowledgeDefault(input.env ?? process.env)
     : solExtractionMode(input.businessId, input.env ?? process.env) !== input.mode) return 'flag_disabled';
   if (!knowledgeReExtractionAvailable(input.profile)) return 'permit_unavailable';
-  if (accuracyFirstExtractionAllowance(input.generationRemainingMs) < SOL_REEXTRACTION_MIN_MS) return 'deadline';
+  if ((input.extractionAllowance ?? accuracyFirstExtractionAllowance)(input.generationRemainingMs) < SOL_REEXTRACTION_MIN_MS) return 'deadline';
   // Leave one admitted attempt for the unchanged verifier.
   if (input.attempts + 2 > input.maxAttempts) return 'attempts';
   return null;
