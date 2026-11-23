@@ -49,7 +49,8 @@ function knowledge(profile: KnowledgeModelProfile, stage: 'extraction' | 're_ext
     routingStage: stage === 'extraction' ? 'knowledge_extraction' : stage === 're_extraction' ? 'knowledge_re_extraction' : 'knowledge_verification',
     systemInstruction: 'OdinLink UNIT ' + stage.toUpperCase(), reasoningEffort: 'low',
     messages: [{ role: 'user', content: JSON.stringify({ question: 'q', requestedLanguage: 'sv', evidence }) }],
-    structuredOutput: knowledgeStructuredOutput(schemaStage, false, schemaStage === 'extraction' ? ['f1'] : undefined, 6, protocol as never), ...over };
+    structuredOutput: knowledgeStructuredOutput(schemaStage, false, schemaStage === 'extraction' ? ['f1'] : undefined,
+      6, protocol as never, undefined, undefined, schemaStage === 'verification' ? evidence.map(e => e.id) : undefined), ...over };
 }
 
 test('conversation + booking tool calling: Sol on the wire with tools, no Luna-only controls, low effort honoured', async t => {
@@ -107,11 +108,27 @@ test('source-exhaustive-v2 verifier runs on Sol: exact schema, low effort, reser
   assert.deepEqual(wires.map(w => [w.model, w.reasoning?.effort, w.text.format.name, w.max_output_tokens, w.service_tier]), [
     [SOL, 'low', 'odinlink_knowledge_extraction_v2', 8192, 'default'],
     [SOL, 'low', 'odinlink_knowledge_source_exhaustive_v2', 8192, 'default']]);
-  assert.deepEqual(wires[1].text.format, { type: 'json_schema', ...knowledgeStructuredOutput('verification', false, undefined, 6, 'source-exhaustive-v2') });
+  assert.deepEqual(wires[1].text.format, { type: 'json_schema', ...knowledgeStructuredOutput('verification', false, undefined, 6, 'source-exhaustive-v2', undefined, undefined, ['e1']) });
   assert.deepEqual(owner.events, ['reserve', 'settle', 'reserve', 'settle']);
   assert.deepEqual([...owner.reservations.values()].map(r => r.quote.stage), ['extraction', 'verification']);
   assert.equal(result.knowledgeUsage?.model, SOL);
 });
+
+for (const ids of [undefined, ['e2']] as const) {
+  test(`managed verifier rejects ${ids ? 'a foreign enum' : 'an unbound schema'} before reservation or HTTP`, async t => {
+    quiet(t);
+    const wires: any[] = [];
+    capture(t, wires);
+    const profile = captureKnowledgeModelProfile(context, PROD);
+    await generateWithOpenAi(knowledge(profile, 'extraction'));
+    await assert.rejects(generateWithOpenAi(knowledge(profile, 'verification', {
+      structuredOutput: knowledgeStructuredOutput('verification', false, undefined, 6, 'source-exhaustive-v2',
+        undefined, undefined, ids),
+    })), /strict_schema/u);
+    assert.equal(wires.length, 1);
+    assert.deepEqual(owner.events, ['reserve', 'settle']);
+  });
+}
 
 test('incompatibility reproduced: the pre-fix adapter omitted low effort on the source-exhaustive schema -> wire_model, no dispatch', async () => {
   const profile = captureKnowledgeModelProfile(context, PROD);

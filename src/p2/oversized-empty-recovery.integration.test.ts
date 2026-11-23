@@ -68,7 +68,8 @@ const sixFirstVisitFacts = [...capturedFacts.slice(0, 3), ...[
   'Receptionen ligger på andra våningen.',
 ].map((text, index) => ({ quote: capturedFacts[3].quote, text, modality: index === 2 ? 'descriptive' : 'required' }))];
 type Entry = readonly [Channel, SourceLanguage, string, readonly string[]];
-type PartialCase = 'incident' | 'optional' | 'condition' | 'conflict' | 'number' | 'citation' | 'stale' | 'independent' | 'linked'
+type ReviewFault = 'unexpected-reviewed-id' | 'missing-reviewed-id' | 'duplicate-reviewed-id';
+type PartialCase = ReviewFault | 'stale-complete' | 'incident' | 'optional' | 'condition' | 'conflict' | 'number' | 'citation' | 'stale' | 'independent' | 'linked'
   | 'compound' | 'compound-after-repair' | 'missing-records' | 'unknown-dependency' | 'linked-condition' | 'affected-unit'
   | 'forged-evidence' | 'inexact-quote' | 'reused-unit-quote' | 'wrong-aspect' | 'incomplete-inventory';
 type PartialFixture = { kind: PartialCase; missingFact?: string };
@@ -126,13 +127,17 @@ function verifier(data: any, mode: Mode) {
 
 function partialVerifier(data: any, { kind, missingFact }: PartialFixture) {
   const verdict = verifier(data, 'ok');
-  if (kind === 'optional') {
+  if (kind === 'optional' || kind === 'stale-complete' || kind.endsWith('-reviewed-id')) {
     // The PDF also recommends reading the studio information before visiting.
     // The fixture verifier judges that unrequested advice independent of the
     // requested arrival time and access directions.
     assert.equal(data.units.length, 6);
     assert.ok(data.evidence.some((item: any) => item.text.includes('Vi rekommenderar att alla besökare läser igenom informationen')));
-    return { ...verdict, sourceCoverage: { ...verdict.sourceCoverage, omissions: { complete: true, records: [] } } };
+    const evidenceIdsReviewed = [...verdict.sourceCoverage.evidenceIdsReviewed];
+    if (kind === 'unexpected-reviewed-id') evidenceIdsReviewed.push('e6-unauthorized');
+    if (kind === 'missing-reviewed-id') evidenceIdsReviewed.pop();
+    if (kind === 'duplicate-reviewed-id') evidenceIdsReviewed[4] = evidenceIdsReviewed[0];
+    return { ...verdict, sourceCoverage: { ...verdict.sourceCoverage, evidenceIdsReviewed, omissions: { complete: true, records: [] } } };
   }
   const compound = isCompound(kind);
   const independent = compound || !!missingFact;
@@ -269,6 +274,13 @@ test('managed durable oversized-empty recovery through native intake and Postgre
         assert.equal(data.requestedLanguage, language);
         assert.equal(data.evidence.length, fixtureCorpus ? 5 : 3);
         assert.ok(data.evidence.every((item: any) => item.businessId === 3));
+        if (stage === 'verification' && wire.text.format.name === 'odinlink_knowledge_source_exhaustive_v2') {
+          assert.equal(wire.text.format.strict, true);
+          const ids = data.evidence.map((item: { id: string }) => item.id);
+          assert.deepEqual(wire.text.format.schema.properties.sourceCoverage.properties.evidenceIdsReviewed, {
+            type: 'array', items: { type: 'string', enum: ids }, minItems: ids.length, maxItems: ids.length,
+          });
+        }
         const hold = [...owner.reservations.values()].find(r => r.quote.stage === stage);
         assert.ok(quotes.includes(stage) && hold);
         const wireBody = JSON.stringify(wire);
@@ -323,7 +335,7 @@ test('managed durable oversized-empty recovery through native intake and Postgre
         const output = refused ? { type: 'refusal', refusal: 'fixture' }
           : { type: 'output_text', text: stage === 'extraction' && mode === 'malformed' ? '{broken' : JSON.stringify(payload), annotations: [] };
         if (stage === 'extraction' && mode === 'changed' || stage === 'verification' && partial?.kind === 'stale') changeSource();
-        if (stage === 'extraction' && mode === 'changed-chunk') {
+        if (stage === 'extraction' && mode === 'changed-chunk' || stage === 'verification' && partial?.kind === 'stale-complete') {
           // Change a canonical PDF chunk without varying its length, timestamp or
           // document segment metadata. Strict validation must reject the old pin.
           const pdf = sources[0];
@@ -574,6 +586,52 @@ test('managed durable oversized-empty recovery through native intake and Postgre
       }
     });
   }
+
+  // Replay the WhatsApp inventory failure with a complete, six-unit
+  // verdict. The mock deliberately returns invalid output over HTTP to prove
+  // that the application guard remains authoritative.
+  for (const [kind, inventory] of [
+    ['unexpected-reviewed-id', { expected: 5, reviewed: 6, missing: 0, unexpected: 1, duplicate: 0 }],
+    ['missing-reviewed-id', { expected: 5, reviewed: 4, missing: 1, unexpected: 0, duplicate: 0 }],
+    ['duplicate-reviewed-id', { expected: 5, reviewed: 5, missing: 1, unexpected: 0, duplicate: 1 }],
+  ] as const) await t.test(`Swedish WhatsApp coverage denies ${kind}`, async st => {
+    const result = await run(st, ['whatsapp', 'sv', questionSv, factsSv], 'ok', 'foreground', { kind });
+    assert.deepEqual(result.failures, []);
+    assert.deepEqual(result.calls, ['extraction', 'verification']);
+    assert.deepEqual(result.quotes, result.calls);
+    assert.equal(result.summaries[0]?.semanticVerifiedUnits, 6);
+    assert.equal(result.posts.length, 1);
+    for (const fact of sixFirstVisitFacts) assert.ok(!result.posts[0].includes(fact.text));
+    const denial = result.decisions.find(event => event.reason === 'INVALID_COVERAGE');
+    assert.equal(denial?.sourceCoverage.guard, 'GUARD_04');
+    assert.deepEqual(denial.sourceCoverage.failedChecks, ['EVIDENCE_INVENTORY_MISMATCH']);
+    assert.deepEqual(denial.sourceCoverage.evidenceInventory, inventory);
+  });
+
+  for (const channel of ['telegram', 'whatsapp', 'instagram', 'messenger'] as const) {
+    await t.test(`Swedish ${channel} publishes six verified units with the exact five-ID inventory`, async st => {
+      const result = await run(st, [channel, 'sv', questionSv, factsSv], 'ok', 'foreground', { kind: 'optional' });
+      assert.deepEqual(result.failures, []);
+      assert.deepEqual(result.calls, ['extraction', 'verification']);
+      assert.deepEqual(result.quotes, result.calls);
+      assert.equal(result.posts.length, 1);
+      for (const fact of sixFirstVisitFacts) assert.ok(result.posts[0].includes(fact.text), result.posts[0]);
+      assert.equal(result.summaries[0]?.semanticVerifiedUnits, 6);
+      const accepted = result.decisions.find(event => event.reason === 'SOURCE_COVERAGE_ACCEPTED');
+      assert.equal(accepted?.sourceCoverage.state, 'COMPLETE');
+      assert.deepEqual(accepted.sourceCoverage.evidenceInventory, { expected: 5, reviewed: 5, missing: 0, unexpected: 0, duplicate: 0 });
+    });
+  }
+
+  await t.test('WhatsApp with an exact review inventory cannot publish after a source revision changes', async st => {
+    const result = await run(st, ['whatsapp', 'sv', questionSv, factsSv], 'ok', 'foreground', { kind: 'stale-complete' });
+    assert.deepEqual(result.failures, []);
+    assert.deepEqual(result.calls, ['extraction', 'verification']);
+    assert.deepEqual(result.quotes, result.calls);
+    assert.equal(result.posts.length, 1);
+    for (const fact of sixFirstVisitFacts) assert.ok(!result.posts[0].includes(fact.text));
+    assert.ok(result.decisions.some(event => event.stage === 'publication' && event.publishableUnits === 0));
+  });
 
   await t.test('Swedish compound: an independent source-bound omission qualifies the arrival recommendation', async st => {
     const result = await run(st, cases[0], 'ok', 'foreground', { kind: 'compound' });

@@ -36,8 +36,12 @@ const keys = (v: any, expected: string[]) => object(v) && same(Object.keys(v), e
 /** The legacy verdict is retained verbatim. This separate, explicitly versioned
  * assessment certifies available-source coverage, never complete policy or an
  * answered obligation. Diagnostic witnesses alone cannot supply this certificate. */
-export function sourceExhaustiveSchema(base: any, protocol: SourceExhaustiveProtocol = SOURCE_EXHAUSTIVE_PROTOCOL) {
+export function sourceExhaustiveSchema(base: any, protocol: SourceExhaustiveProtocol = SOURCE_EXHAUSTIVE_PROTOCOL,
+  evidenceIds?: readonly string[]) {
   const str = { type: 'string' }, bool = { type: 'boolean' };
+  const reviewedIds = protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL ? evidenceIds : undefined;
+  if (reviewedIds && (!reviewedIds.length || reviewedIds.length > 6 || new Set(reviewedIds).size !== reviewedIds.length ||
+      reviewedIds.some(id => typeof id !== 'string' || !id.trim()))) throw new Error('invalid_verifier_evidence_ids');
   const alignment = protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL ? { ...bool, description: requestPlanAlignment } : bool;
   const bounded = (maxLength: number, minLength = 1) => ({ type: 'string', minLength, maxLength });
   const strict = (properties: Record<string, unknown>) => ({ type: 'object', additionalProperties: false, properties, required: Object.keys(properties) });
@@ -50,7 +54,8 @@ export function sourceExhaustiveSchema(base: any, protocol: SourceExhaustiveProt
   const assessment = strict({
     protocol: { type: 'string', enum: [protocol] }, requestAligned: alignment,
     availableMaterialFactsComplete: protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL ? { ...bool, description: availableCompleteness } : bool, conditionsPreserved: bool, conflictsAbsent: bool,
-    evidenceIdsReviewed: { type: 'array', items: str, minItems: 1, maxItems: 6 },
+    evidenceIdsReviewed: { type: 'array', items: reviewedIds ? { ...str, enum: [...reviewedIds] } : str,
+      minItems: reviewedIds?.length ?? 1, maxItems: reviewedIds?.length ?? 6 },
     acceptedUnitIdsReviewed: { type: 'array', items: str, minItems: 1, maxItems: 6 },
     obligations: { type: 'array', minItems: 1, maxItems: 8, items: { type: 'object', additionalProperties: false,
       properties: { facetId: str, obligationId: str, state: { type: 'string', enum: SOURCE_COVERAGE_STATES.filter(state => state !== independentOmission || protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL),

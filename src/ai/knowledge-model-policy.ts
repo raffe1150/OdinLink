@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 import { knowledgeStructuredOutput } from './knowledge-answer-protocol';
-import { isSourceExhaustiveProtocol } from './source-exhaustive-coverage';
+import { isSourceExhaustiveProtocol, SOURCE_EXHAUSTIVE_V2_PROTOCOL } from './source-exhaustive-coverage';
 import type { UnifiedAiGenerationRequest } from './providers/provider';
 import { managedKnowledgeDefault } from './model-routing';
 import { ACCURACY_FIRST_POLICY, knowledgeStageCapMs } from './knowledge-timing-policy';
@@ -274,16 +274,22 @@ function validRequest(request: UnifiedAiGenerationRequest, state: Permit) {
   const max = object(units) && typeof units.maxItems === 'number' ? units.maxItems : 6;
   // A re-extraction is a complete fresh extraction under the same schema.
   const schemaStage = state.stage === 'verification' ? 'verification' : 'extraction';
-  if (schemaStage === 'extraction') check(allowedIds && (max === 5 || max === 6), 'bounded_extraction');
-  // The verifier contract is the turn's CAPTURED protocol (v2 or
-  // source-exhaustive); any other schema, natural mode or witness fails closed.
-  check(isDeepStrictEqual(schema, schemaStage === 'verification'
-    ? knowledgeStructuredOutput('verification', false, undefined, 6, state.selection.verificationProtocol as never)
-    : knowledgeStructuredOutput('extraction', false, allowedIds, max, 'v2')), 'strict_schema');
+  if (schemaStage === 'extraction') {
+    check(allowedIds && (max === 5 || max === 6), 'bounded_extraction');
+    check(isDeepStrictEqual(schema, knowledgeStructuredOutput('extraction', false, allowedIds, max, 'v2')), 'strict_schema');
+  }
   check(!request.tools?.length && request.messages.length === 1 && request.messages[0].role === 'user', 'request_scope');
   const data: unknown = JSON.parse(request.messages[0].content);
   check(object(data) && Array.isArray(data.evidence) && data.evidence.length &&
     data.evidence.every(e => object(e) && e.businessId === state.selection.binding.businessId), 'evidence_tenant');
+  if (schemaStage === 'verification') {
+    const protocol = state.selection.verificationProtocol;
+    // Rebuild the bound schema from the tenant-checked request before admitting
+    // spend. The adapter also checks the final serialized wire.
+    const evidenceIds = protocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL ? data.evidence.map(e => e.id) : undefined;
+    check(isDeepStrictEqual(schema, knowledgeStructuredOutput('verification', false, undefined, 6,
+      protocol as never, undefined, undefined, evidenceIds)), 'strict_schema');
+  }
 }
 function usageOf(raw: unknown, quote: KnowledgeCostQuote, owner: Owner): KnowledgeUsage {
   check(object(raw) && raw.model === quote.model && raw.service_tier === 'default', 'receipt_identity');

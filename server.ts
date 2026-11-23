@@ -1,4 +1,4 @@
-import { isSourceExhaustiveProtocol } from './src/ai/source-exhaustive-coverage';
+import { isSourceExhaustiveProtocol, SOURCE_EXHAUSTIVE_V2_PROTOCOL } from './src/ai/source-exhaustive-coverage';
 import { classifyKnowledgeFallback, contextualKnowledgeFallback, previousAssistantReply } from './src/ai/knowledge-fallback';
 import { knowledgePresentationConfig, presentVerifiedManifest, PRESENTATION_SCHEMA } from './src/ai/knowledge-presentation';
 import { composerSnapshot, naturalComposerConfig, previousCustomerMessage, runNaturalComposer, runNaturalComposerShadow, skippedComposerRecord } from './src/ai/natural-composer-shadow';
@@ -6158,13 +6158,16 @@ async function generateNativeKnowledgeContent(sessionId:string,options:any,suppo
             (stage === 'extraction' ? accuracyFirstExtractionAllowance(state.budget!.generationRemaining(), state.budget!.nativeTiming?.policy)
               : Math.min((state.budget!.nativeTiming?.policy ?? ACCURACY_FIRST_POLICY).verificationMs, state.budget!.generationRemaining())));
           sol = !!profileOptions.knowledgeExecution;
+          const verificationEvidenceIds = stage === 'verification' && verificationProtocol === SOURCE_EXHAUSTIVE_V2_PROTOCOL &&
+            getConfiguredAiProvider() === 'openai'
+            ? (wireData as { evidence: readonly Pick<Evidence, 'id'>[] }).evidence.map(({ id }) => id) : undefined;
           const pending = generateContentWithFallback(null, { messages: [{ role: 'user', content: JSON.stringify(wireData) }],
           systemInstruction: instruction, tools: [], informationBudget: state.budget,
           ...profileOptions,
           ...((stage==='extraction' || stage==='verification' && !(state.budget instanceof DurableKnowledgeBudget)) ? {reasoningEffort:'low' as const} : {}),
           ...(stage!=='composition'?{structuredOutput:knowledgeStructuredOutput(stage,state.naturalEnabled,
             stage==='extraction' ? state.facets?.map(f=>f.id) : undefined,
-            stage==='extraction'&&(data as {authorityScope?:unknown})?.authorityScope==='document_only'?5:6,verificationProtocol,contract?.extractionProtocol,contract?.canonicalConfiguration)}:{}),
+            stage==='extraction'&&(data as {authorityScope?:unknown})?.authorityScope==='document_only'?5:6,verificationProtocol,contract?.extractionProtocol,contract?.canonicalConfiguration,verificationEvidenceIds)}:{}),
           context: { ...businessInformationTimingContext(sessionId), businessId: state.businessId, channel: 'knowledge-core', stage: `knowledge_units_${requestedStage}`, language: capturedSupportLanguage(support) } });
           if(requestedStage==='extraction'||requestedStage==='verification')runOptionalDiagnostic(()=>state.durableProgress?.(requestedStage,(state.facets||[]).map(f=>f.attribute)));
           const result=await pending;

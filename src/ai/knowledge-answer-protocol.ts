@@ -170,7 +170,8 @@ const naturalValidation = object({contractHash:str,proposalHash:str,
   flags:object(Object.fromEntries(NATURAL_FLAGS.map(key=>[key,bool])))});
 export function knowledgeStructuredOutput(stage: keyof typeof schemas|'presentation_verification', natural=false,
   allowedFacetIds?: readonly string[], maximumUnits=6, verificationProtocol?: KnowledgeVerificationProtocol,
-  extractionProtocol:KnowledgeExtractionProtocol='v2',canonicalConfiguration?:CanonicalConfigurationProducer): UnifiedAiStructuredOutputRequest {
+  extractionProtocol:KnowledgeExtractionProtocol='v2',canonicalConfiguration?:CanonicalConfigurationProducer,
+  verificationEvidenceIds?: readonly string[]): UnifiedAiStructuredOutputRequest {
   assertKnowledgeExtractionProtocol(extractionProtocol);
   if(canonicalConfiguration&&(stage!=='extraction'||natural||extractionProtocol!=='literal-evidence-v1'||!allowedFacetIds?.length))
     throw Error('invalid_canonical_configuration_extraction');
@@ -180,7 +181,7 @@ export function knowledgeStructuredOutput(stage: keyof typeof schemas|'presentat
     if(protocol==='compact-v1')return{name:COMPACT_VERIFICATION_NAME,strict:true,schema:compactVerificationSchema()};
     if(protocol===COVERAGE_WITNESS_PROTOCOL)return{name:COVERAGE_WITNESS_SCHEMA_NAME,strict:true,schema:coverageWitnessSchema(schemas.verification)};
     if(isSourceExhaustiveProtocol(protocol))return{name:protocol===SOURCE_EXHAUSTIVE_V2_PROTOCOL?SOURCE_EXHAUSTIVE_V2_SCHEMA_NAME:SOURCE_EXHAUSTIVE_SCHEMA_NAME,
-      strict:true,schema:sourceExhaustiveSchema(schemas.verification,protocol)};
+      strict:true,schema:sourceExhaustiveSchema(schemas.verification,protocol,verificationEvidenceIds)};
   }
   if(stage==='presentation_verification')return{name:'odinlink_natural_validation_v1',strict:true,schema:naturalValidation};
   // Request-local enum, never a shared-schema mutation or a parser repair.
