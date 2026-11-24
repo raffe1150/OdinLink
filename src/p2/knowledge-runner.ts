@@ -1,5 +1,6 @@
 import { knowledgeOperation, knowledgeOperationSignal, knowledgeExecutionDeadline, KNOWLEDGE_OPERATION_LIMITS } from './knowledge-operation';
 import { runOptionalDiagnostic } from '../ai/business-information-timing';
+import { durableTiming, durableTraceFor, emitDurableTiming, inDurableTrace, timeDurableWork } from './durable-knowledge-trace';
 import { boundedInteger, captureVerified, safeUnavailableKnowledge, resultDigest, requireId, snapshot, type Checkpoint, type DeliveryOutcome,
   type KnowledgeAuthority, type KnowledgeDelivery, type KnowledgeLifecycleRepository, type KnowledgeScope, type KnowledgeTask,
   type TaskToken, type VerifiedKnowledge } from './knowledge-lifecycle';
@@ -25,7 +26,7 @@ export type RunnerEvent = Readonly<{ turnId: string; channel: KnowledgeScope['ch
  * discover durable work and call run/recover after startup; no constructor side
  * effects or production feature flag is enabled by this module. */
 export class KnowledgeRunner {
-  private active = new Map<string, AbortController>();
+  private active = new Map<string, { abort: AbortController; claiming: boolean }>();
   private stopped = false;
   constructor(private readonly repository: KnowledgeLifecycleRepository, private readonly execute: KnowledgeExecutor,
     private readonly owner: string, private readonly concurrency = 2,
@@ -36,7 +37,12 @@ export class KnowledgeRunner {
     runOptionalDiagnostic(() => this.telemetry?.({ turnId: task.turnId, channel: task.scope.channel, fence: task.fence, attempt: task.runAttempts, stage, customerDelivery: 'UNCONFIRMED' }));
   }
   get capacity(): number { return this.concurrency; }
-  stop(): void { this.stopped = true; for (const controller of this.active.values()) controller.abort(); }
+  stop(): void {
+    this.stopped = true;
+    // A claim in flight can already have committed. Let its bounded read return
+    // the fence so this worker can relinquish it without entering execution.
+    for (const run of this.active.values()) if (!run.claiming) run.abort.abort();
+  }
   async recover(scope: KnowledgeScope): Promise<void> {
     const tasks = await knowledgeOperation(()=>this.repository.recover(scope));
     // Bounded one scan; no recursive polling or detached retries.
@@ -49,85 +55,124 @@ export class KnowledgeRunner {
     scope = snapshot(scope);
     const key = JSON.stringify([scope, taskId]);
     if (this.stopped || this.active.has(key) || this.active.size >= this.concurrency) return null;
-    const abort = new AbortController(); this.active.set(key, abort);
+    const abort = new AbortController();
+    const run = { abort, claiming: true };
+    this.active.set(key, run);
     const inherited=knowledgeOperationSignal();const signal=AbortSignal.any([abort.signal,...(inherited?[inherited]:[])]);
     let timer: ReturnType<typeof setTimeout> | undefined;
     let heartbeat: ReturnType<typeof setInterval> | undefined;
     let renewing = false; let heartbeatFailure: unknown; let primaryFailure: unknown; let renewal: Promise<void> | undefined;
     let task: KnowledgeTask | null = null;
+    let trace: ReturnType<typeof durableTraceFor> | undefined;
+    const claimStarted = Date.now();
     try {
-      task = await knowledgeOperation(()=>this.repository.claim(scope, taskId, this.owner, this.leaseMs),{signal});
-      if (!task || signal.aborted) return null;
-      const token: TaskToken = { taskId: task.id, owner: this.owner, fence: task.fence };
+      const claimed = await knowledgeOperation(()=>this.repository.claim(scope, taskId, this.owner, this.leaseMs),{signal});
+      run.claiming = false;
+      if (!claimed) return null;
+      task = claimed;
+      const claimedTrace = durableTraceFor(claimed);
+      trace = claimedTrace;
+      emitDurableTiming(claimedTrace.turn, 'worker_claimed', { durationMs: Date.now() - claimStarted, expiresAt: claimed.expiresAt,
+        executionDeadlineAt: knowledgeExecutionDeadline(claimed), leaseUntil: claimed.lease?.until, priorModelAttempts: claimed.modelAttempts });
+      if (this.stopped) abort.abort();
+      const token: TaskToken = { taskId: claimed.id, owner: this.owner, fence: claimed.fence };
       const current = () => {
-        if (signal.aborted || Date.now() >= task!.expiresAt) throw new Error('knowledge_runner_stopped');
+        if (signal.aborted || Date.now() >= claimed.expiresAt) throw new Error('knowledge_runner_stopped');
       };
       current();
-      timer = setTimeout(() => abort.abort(), Math.max(1, task.expiresAt - Date.now()));
+      timer = setTimeout(() => abort.abort(), Math.max(1, claimed.expiresAt - Date.now()));
       heartbeat = setInterval(() => {
         if (renewing || signal.aborted) return;
         renewing = true;
-        renewal = knowledgeOperation(()=>this.repository.renew(scope, token, this.leaseMs),{signal}).then(ok => { if (!ok) { if (task) this.event(task, 'lease_lost'); abort.abort(); } },
-          error => { heartbeatFailure = error; abort.abort(); }).finally(() => { renewing = false; });
+        const started = Date.now();
+        const record = (renewed: boolean) => emitDurableTiming(claimedTrace.turn, 'worker_renewal',
+          { renewed, durationMs: Date.now() - started });
+        renewal = knowledgeOperation(()=>this.repository.renew(scope, token, this.leaseMs),{signal}).then(ok => {
+          record(ok);
+          if (!ok) { this.event(claimed, 'lease_lost'); abort.abort(); }
+        }, error => { record(false); heartbeatFailure = error; abort.abort(); }).finally(() => { renewing = false; });
       }, Math.max(10, Math.floor(this.leaseMs / 3)));
-      this.event(task, 'claimed');
-      if (task.state !== 'VERIFIED') {
-        let checkpoint = task.checkpoint;
-        const order: Checkpoint[] = ['planning', 'retrieval', 'extraction'];
-        const deadlineAt = knowledgeExecutionDeadline(task);
-        const fallback = () => task!.publicationV2 ? safeUnavailableKnowledge(task!.input.language) : null;
-        let result: VerifiedKnowledge | null;
-        try {
-          result = task.publicationV2 && (task.finalOnly || Date.now() >= deadlineAt) ? fallback()
-            : await knowledgeOperation(executionSignal=>this.execute(task!, { signal: executionSignal, expiresAt: task!.expiresAt,
-              ownsLease: async () => {
-                if (executionSignal.aborted) return false;
-                const latest = await knowledgeOperation(() => this.repository.get(scope, taskId), { signal: executionSignal });
-                return !executionSignal.aborted && latest?.state === 'RUNNING' && latest.fence === token.fence &&
-                  latest.lease?.owner === token.owner && latest.lease.until > Date.now() && latest.expiresAt > Date.now();
-              },
-              reserveModelAttempt: async () => {
-                if(executionSignal.aborted)throw new Error('knowledge_runner_stopped');
-                current();
-                if (!await knowledgeOperation(()=>this.repository.reserveModelAttempt(scope, token),{signal:executionSignal})) {
-                  if (!task!.publicationV2) abort.abort();
-                  throw new Error('knowledge_attempt_not_reserved');
-                }
-                current();
-              },
-              checkpoint: async stage => {
-                if(executionSignal.aborted)throw new Error('knowledge_runner_stopped');
-                current();
-                // Recovery may recompute earlier stages, without regressing markers.
-                if (order.indexOf(stage) <= order.indexOf(checkpoint!)) return;
-                if (!await knowledgeOperation(()=>this.repository.checkpoint(scope, token, stage),{signal:executionSignal})) { abort.abort(); throw new Error('knowledge_checkpoint_rejected'); }
-                checkpoint = stage; current();
-              },
-            }),{signal,deadlineAt,timeoutMs:120000});
-        } catch (error) {
-          if (!task.publicationV2 || signal.aborted) throw error;
-          this.event(task, 'execution_error');
-          result = fallback();
+      this.event(claimed, 'claimed');
+      return await inDurableTrace(claimedTrace, async () => {
+        if (claimed.state !== 'VERIFIED') {
+          let checkpoint = claimed.checkpoint;
+          const order: Checkpoint[] = ['planning', 'retrieval', 'extraction'];
+          const deadlineAt = knowledgeExecutionDeadline(claimed);
+          const fallback = () => claimed.publicationV2 ? safeUnavailableKnowledge(claimed.input.language) : null;
+          // The persisted counter cannot distinguish pre-SDK cancellation from
+          // a dispatched request. A new owner must not repeat uncertain work,
+          // even if its configured model or financial owner has since changed.
+          const priorAttempt = claimed.runAttempts > 1 && claimed.modelAttempts > 0;
+          if (claimed.publicationV2 && priorAttempt) durableTiming('recovery_final_only', { priorModelAttempts: claimed.modelAttempts });
+          let result: VerifiedKnowledge | null;
+          try {
+            result = claimed.publicationV2 && (claimed.finalOnly || priorAttempt || Date.now() >= deadlineAt) ? fallback()
+              : await knowledgeOperation(executionSignal=>this.execute(claimed, { signal: executionSignal, expiresAt: claimed.expiresAt,
+                ownsLease: async () => {
+                  if (executionSignal.aborted) return false;
+                  if (this.repository.ownsLease) {
+                    const owned = await knowledgeOperation(() => this.repository.ownsLease!(scope, token), { signal: executionSignal });
+                    return !executionSignal.aborted && owned;
+                  }
+                  const latest = await knowledgeOperation(() => this.repository.get(scope, taskId), { signal: executionSignal });
+                  return !executionSignal.aborted && latest?.state === 'RUNNING' && latest.fence === token.fence &&
+                    latest.lease?.owner === token.owner && latest.lease.until > Date.now() && latest.expiresAt > Date.now();
+                },
+                reserveModelAttempt: async () => {
+                  if(executionSignal.aborted)throw new Error('knowledge_runner_stopped');
+                  current();
+                  if (!await timeDurableWork('model_attempt_reservation', () =>
+                    knowledgeOperation(()=>this.repository.reserveModelAttempt(scope, token),{signal:executionSignal}))) {
+                    if (!claimed.publicationV2) abort.abort();
+                    throw new Error('knowledge_attempt_not_reserved');
+                  }
+                  current();
+                },
+                checkpoint: async stage => {
+                  if(executionSignal.aborted)throw new Error('knowledge_runner_stopped');
+                  current();
+                  // Recovery may recompute earlier stages, without regressing markers.
+                  if (order.indexOf(stage) <= order.indexOf(checkpoint!)) return;
+                  if (!await timeDurableWork('checkpoint', () =>
+                    knowledgeOperation(()=>this.repository.checkpoint(scope, token, stage),{signal:executionSignal}), { stage })) {
+                    abort.abort(); throw new Error('knowledge_checkpoint_rejected');
+                  }
+                  checkpoint = stage; current();
+                },
+              }),{signal,deadlineAt,timeoutMs:120000});
+          } catch (error) {
+            if (!claimed.publicationV2 || signal.aborted) throw error;
+            this.event(claimed, 'execution_error');
+            result = fallback();
+          }
+          result ??= fallback();
+          current();
+          if (!result) { this.event(claimed, await knowledgeOperation(()=>this.repository.fail(scope, token),{signal}) ? 'failed' : 'lease_lost'); return null; }
+          if (!await timeDurableWork('persist_result', () => knowledgeOperation(()=>this.repository.verified(scope, token, captureVerified(result)),{signal}),
+            { independentlyVerified: result.independentlyVerified })) return null;
+          this.event(claimed, 'verified');
         }
-        result ??= fallback();
         current();
-        if (!result) { this.event(task, await knowledgeOperation(()=>this.repository.fail(scope, token),{signal}) ? 'failed' : 'lease_lost'); return null; }
-        if (!await knowledgeOperation(()=>this.repository.verified(scope, token, captureVerified(result)),{signal})) return null;
-        this.event(task, 'verified');
-      }
-      current();
-      // Repository invokes its trusted live authority dependency anew here,
-      // including for recovered VERIFIED tasks. Stored flags grant no authority.
-      const delivery = await knowledgeOperation(()=>this.repository.finalize(scope, token),{signal,deadlineAt:task.expiresAt,timeoutMs:15000});
-      if (delivery) this.event(task, 'finalized');
-      else this.event(task,await knowledgeOperation(()=>this.repository.fail(scope,token),{signal})?'failed':'lease_lost');
-      return delivery;
+        // Repository invokes its trusted live authority dependency anew here,
+        // including for recovered VERIFIED tasks. Stored flags grant no authority.
+        const delivery = await timeDurableWork('finalize', () =>
+          knowledgeOperation(()=>this.repository.finalize(scope, token),{signal,deadlineAt:claimed.expiresAt,timeoutMs:15000}));
+        if (delivery) this.event(claimed, 'finalized');
+        else this.event(claimed,await knowledgeOperation(()=>this.repository.fail(scope,token),{signal})?'failed':'lease_lost');
+        return delivery;
+      });
     } catch (error) {
       primaryFailure = error;
       if (task) {
-        this.event(task, 'execution_error');
+        if (!this.stopped) this.event(task, 'execution_error');
+        if (heartbeat) clearInterval(heartbeat);
         const token:TaskToken={taskId:task.id,owner:this.owner,fence:task.fence};
-        try{await knowledgeOperation(()=>this.repository.interrupt?.(scope,token)??Promise.resolve(false),{independent:true});}catch{}
+        const started = Date.now();
+        let released = false;
+        try {
+          released = await knowledgeOperation(()=>this.repository.interrupt?.(scope,token)??Promise.resolve(false),{independent:true});
+        } catch { /* If relinquishment is uncertain, recovery still uses the original lease. */ }
+        if (trace) emitDurableTiming(trace.turn, 'worker_interrupted', { controlled: this.stopped, released, durationMs: Date.now() - started });
       }
       throw error;
     }
@@ -136,6 +181,9 @@ export class KnowledgeRunner {
       if (heartbeat) clearInterval(heartbeat);
       abort.abort();
       await renewal;
+      // The host's shutdown grace bounds this wait. Let in-flight managed calls
+      // record an authentic receipt or retain their hold before process exit.
+      if (this.stopped && trace) await Promise.allSettled(trace.providerWork);
       this.active.delete(key);
       if (task) this.event(task, 'stopped');
       // Repository/heartbeat errors are business errors, not swallowed telemetry.
@@ -182,6 +230,8 @@ export async function deliverKnowledge(repository: KnowledgeLifecycleRepository,
       return null;
     }
     deadlineAt=Math.min(deadlineAt,task.expiresAt);
+    emitDurableTiming({ turnId: task.turnId, acceptedAt: task.acceptedAt, channel: scope.channel },
+      'delivery_started', { durationMs: Date.now() - started, deadlineAt });
     const reject=async()=>{if(repository.rejectDelivery)await knowledgeOperation(()=>repository.rejectDelivery!(scope,taskId,deliveryId),{independent:true});return null;};
     const resolved=await step(()=>transport.resolve(task));
     target=resolved?Object.freeze({recipient:resolved.recipient,channel:resolved.channel,providerAccount:resolved.providerAccount,
@@ -199,15 +249,21 @@ export async function deliverKnowledge(repository: KnowledgeLifecycleRepository,
     }
     delivery=await step(()=>repository.claimDelivery(scope,deliveryId,owner,15000));
     if(!delivery || delivery.taskId!==taskId || !delivery.lease)return null;
+    emitDurableTiming({ turnId: task.turnId, acceptedAt: task.acceptedAt, channel: scope.channel },
+      'delivery_claimed', { durationMs: Date.now() - started, deliveryFence: delivery.fence, deliveryAttempt: delivery.attempts });
     deadlineAt=Math.min(deadlineAt,delivery.lease.until);
   } catch(error) {
     try { await knowledgeOperation(()=>repository.deferDelivery?.(scope,taskId,deliveryId)??Promise.resolve(false),{independent:true}); } catch {}
     throw error;
   }
   const token={deliveryId,owner,fence:delivery.fence};
-  const event=(stage:RunnerEvent['stage'],outcome?:DeliveryOutcome['kind'],settled?:boolean)=>runOptionalDiagnostic(()=>telemetry?.({
-    turnId:task.turnId,channel:scope.channel,fence:delivery.fence,attempt:delivery.attempts,stage,
-    ...(outcome?{outcome}:{}),...(settled!==undefined?{settled}:{}),durationMs:Date.now()-started,customerDelivery:'UNCONFIRMED'}));
+  const event=(stage:RunnerEvent['stage'],outcome?:DeliveryOutcome['kind'],settled?:boolean)=>{
+    const durationMs = Date.now() - started;
+    emitDurableTiming({ turnId: task.turnId, acceptedAt: task.acceptedAt, channel: scope.channel }, `delivery_${stage}`,
+      { durationMs, deliveryFence: delivery.fence, deliveryAttempt: delivery.attempts, outcome, settled, deadlineAt });
+    runOptionalDiagnostic(()=>telemetry?.({turnId:task.turnId,channel:scope.channel,fence:delivery.fence,attempt:delivery.attempts,stage,
+      ...(outcome?{outcome}:{}),...(settled!==undefined?{settled}:{}),durationMs,customerDelivery:'UNCONFIRMED'}));
+  };
   const settle=async(outcome:DeliveryOutcome)=>{
     try {
       const settled=await knowledgeOperation(()=>repository.settleDelivery(scope,token,outcome),{independent:true});

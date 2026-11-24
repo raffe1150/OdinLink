@@ -1,4 +1,5 @@
 import { knowledgeCycleTimeoutMs, knowledgeDatabaseRead, knowledgeOperation, knowledgeOperationSignal } from './knowledge-operation';
+import { durableTiming, emitDurableTiming, timeDurableWork } from './durable-knowledge-trace';
 import { preflightRejected } from './knowledge-preflight-diagnostic';
 import { SmartWaitingCoordinator, smartWaitingControls, type WaitingControls, type WaitingSchedule, type WaitingHandle } from './smart-waiting';
 import { NativeKnowledgeProgressAuthority } from './knowledge-progress-authority';
@@ -67,8 +68,10 @@ export class NativeKnowledgeRuntime {
     this.waiting=new SmartWaitingCoordinator({controls:waitingControls,authority:progress,schedule:options.waitingSchedule,
       send:(target,text,signal)=>sendNativeKnowledge(target.connection,target.recipient,text,signal,fetcher),diagnostic:event=>this.event(event)});
     this.runner=new KnowledgeRunner(this.repository,async(task,context)=>{
-      if (!await nativeProviderEligible(this.bindings, task, fetcher, context.signal, undefined,
-        reason => preflightRejected(task.turnId, task.scope.channel, 'provider', reason), true)) return null;
+      const eligible = await timeDurableWork('execution_preflight', () => nativeProviderEligible(this.bindings, task, fetcher, context.signal, undefined,
+        reason => preflightRejected(task.turnId, task.scope.channel, 'provider', reason), true));
+      durableTiming('execution_preflight_result', { eligible });
+      if (!eligible) return null;
       let waiting:WaitingHandle={progress:()=>{},stop:()=>{}};
       try{waiting=this.waiting.begin(task,context.signal);}catch{this.event({stage:'waiting_setup_failed',turnId:task.turnId,channel:task.scope.channel});}
       try{return await options.execute(task,{...context,progress:(stage,labels)=>waiting.progress(stage,labels)},
@@ -103,7 +106,11 @@ export class NativeKnowledgeRuntime {
           after.binding.recipient!==target.recipient || !await knowledgeTurnCurrent(db,task,provider) || signal.aborted ||
           Date.now()>=task.expiresAt || !options.controls().delivery || this.stopped)return noSend;
         this.event({stage:'native_send_attempt',turnId:task.turnId,channel:task.scope.channel});
+        const timing = { turnId: task.turnId, acceptedAt: task.acceptedAt, channel: task.scope.channel };
+        const started = Date.now();
+        emitDurableTiming(timing, 'channel_dispatch');
         const outcome=await sendNativeKnowledge(before.connection,target.recipient,text,signal,fetcher);
+        emitDurableTiming(timing, 'channel_return', { outcome: outcome.kind, durationMs: Date.now() - started });
         this.event({stage:`native_${outcome.kind.toLowerCase()}`,turnId:task.turnId,channel:task.scope.channel});
         return outcome;
       }};
@@ -116,6 +123,7 @@ export class NativeKnowledgeRuntime {
     if(!this.admissionEnabledFor(ingress.businessId))return null;
     ingress=snapshot(ingress);
     const scope=await this.bindings.ensure(ingress.businessId,ingress.channel,ingress.account,ingress.recipient);
+    if (this.stopped) return null;
     const result=await this.repository.acceptOrdered(scope,ingress.eventId,ingress.order,undefined,{executionMs:nativeExecutionMsFor(this.options.controls(),scope.businessId)});
     this.event({stage:`native_${result.disposition.toLowerCase()}`,turnId:result.acceptance?.identity.turnId,channel:ingress.channel});
     return snapshot({scope,eventId:ingress.eventId,order:ingress.order,result});
@@ -127,7 +135,9 @@ export class NativeKnowledgeRuntime {
   get admissionEnabled():boolean { return !this.stopped && this.options.controls().admission; }
   async beginIntake(ingress:NativeKnowledgeIngress, context:string) {
     if(!this.admissionEnabledFor(ingress.businessId))return null;
+    const started = Date.now();
     const scope=await this.bindings.ensure(ingress.businessId,ingress.channel,ingress.account,ingress.recipient);
+    if (this.stopped) return null;
     const owner=randomUUID();
     const controls=this.options.controls();
     const maxModels=scope.businessId===3 && controls.publicationV2 ? controls.fiveAttempts ? 5 : 4 : undefined;
@@ -135,6 +145,9 @@ export class NativeKnowledgeRuntime {
       nativeExecutionMsFor(controls,scope.businessId),maxModels);
     const admission:NativeKnowledgeAdmission=snapshot({scope,eventId:ingress.eventId,order:ingress.order,result:accepted.result,intakeOwner:accepted.owner});
     const run=accepted.result.acceptance?.inserted===true && accepted.state==='ROUTING' && accepted.owner===owner;
+    const identity = accepted.result.acceptance?.identity;
+    if (identity) emitDurableTiming({ turnId: identity.turnId, acceptedAt: identity.acceptedAt, channel: scope.channel },
+      'intake_begin', { durationMs: Date.now() - started, ingressAt: ingress.order?.atMs, expiresAt: identity.expiresAt, routing: run });
     if(!run && accepted.state!=='TERMINAL' && accepted.state!=='ATTACHED') {
       const recovered=await this.repository.intake(scope,ingress.eventId,ingress.order,'reconcile',owner);
       if(!['ATTACHED','TERMINAL'].includes(recovered.state))throw new Error('knowledge_intake_still_routing');
@@ -148,12 +161,16 @@ export class NativeKnowledgeRuntime {
   }
   async attach(admission:NativeKnowledgeAdmission,input:KnowledgeInput):Promise<OrderedAdmission|null>{
     if(this.stopped || !this.options.controls().admission || !admission.result.mayAttach)return null;
+    const started = Date.now();
     let result:OrderedAdmission;
     if(admission.intakeOwner) {
       await this.repository.intake(admission.scope,admission.eventId,admission.order,'prepare',admission.intakeOwner,'',input);
       result=(await this.repository.intake(admission.scope,admission.eventId,admission.order,'reconcile',admission.intakeOwner)).result;
     } else result=await this.repository.acceptOrdered(admission.scope,admission.eventId,admission.order,input);
     this.event({stage:result.mayAttach?'native_attached':'native_attachment_rejected',turnId:result.acceptance?.identity.turnId,channel:admission.scope.channel});
+    const identity = result.acceptance?.identity;
+    if (identity) emitDurableTiming({ turnId: identity.turnId, acceptedAt: identity.acceptedAt, channel: admission.scope.channel },
+      'attachment', { durationMs: Date.now() - started, attached: identity.taskId !== null });
     return result;
   }
   async history(admission:NativeKnowledgeAdmission,foreground:readonly any[]):Promise<KnowledgeInput['history']>{
@@ -181,13 +198,13 @@ export class NativeKnowledgeRuntime {
       if(this.options.controls().processing)await this.repository.recoverIntakes();
       return this.cycle.tick();
     },{timeoutMs:knowledgeCycleTimeoutMs(nativeMaxExecutionMs(this.options.controls()))});this.pending=pending;
-    try{this.lastReport=await pending;return this.lastReport;}catch(error){this.lastFailure=error;throw error;}finally{if(this.pending===pending)this.pending=undefined;}
+    try{this.lastReport=await pending;return this.lastReport;}catch(error){if(!this.stopped)this.lastFailure=error;throw error;}finally{if(this.pending===pending)this.pending=undefined;}
   }
   start(intervalMs=1000):void{
     if(this.stopped || this.timer || !this.options.controls().processing && !this.options.controls().delivery)return;
     if(!Number.isSafeInteger(intervalMs)||intervalMs<250||intervalMs>10000)throw new Error('knowledge_invalid_poll_interval');
     const schedule=()=>{if(this.stopped)return;this.timer=setTimeout(async()=>{
-      try{await this.tick();}catch{this.event({stage:'host_cycle_failed'});}finally{schedule();}
+      try{await this.tick();}catch{if(!this.stopped)this.event({stage:'host_cycle_failed'});}finally{schedule();}
     },intervalMs);this.timer.unref();};schedule();
   }
   async stop(graceMs=5000):Promise<boolean>{

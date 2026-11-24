@@ -96,11 +96,14 @@ export const accuracyFirstExtractionAllowance = (generationMs: number, policy: K
  * (ODINLINK_ASYNC_KNOWLEDGE_EXTENDED_TENANTS). Every value is an upper bound; each stage is ALSO bounded by the task's
  * persisted execution deadline (expiresAt - 15 s lifecycle reserve) minus the 1.5 s publication reserve.
  * - extractionMs 30 s: the foreground 20 s cap was observed too short for Sol Extraction (2026-11-23 21:14).
- * - verificationReserveMs 22 s: reserved against extraction and also the ceiling for independent verification.
- *   Time spent between stages reduces the remaining generation budget available to the verifier.
+ * - verificationReserveMs 22 s: independent verification ceiling, protected during extraction.
+ * - betweenStagesMs 2 s: protect the checkpoint and source checks observed between stages.
+ * - extractionDispatchMs 12 s: minimum useful extraction window, just above the fast
+ *   10.4–11.9 s observed extraction cases. This is an admission floor, not a latency SLO.
  * Model, money limits, reservation keys, attempts and unknown-dispatch handling are unaffected. */
 export const DURABLE_EXTENDED_STAGE_TIMING = Object.freeze({
-  version: 'durable-extended-stages-v1', windowMs: 75_000, extractionMs: 30_000, verificationReserveMs: 22_000 });
+  version: 'durable-extended-stages-v1', windowMs: 75_000, extractionMs: 30_000, verificationReserveMs: 22_000,
+  betweenStagesMs: 2_000, extractionDispatchMs: 12_000 });
 export type DurableStageTiming = typeof DURABLE_EXTENDED_STAGE_TIMING;
 /** Per-request cap of a managed Sol stage under the durable policy (re_extraction is an extraction). */
 export const durableStageCapMs = (stage: string, timing: DurableStageTiming = DURABLE_EXTENDED_STAGE_TIMING): number =>
@@ -108,7 +111,8 @@ export const durableStageCapMs = (stage: string, timing: DurableStageTiming = DU
 /** Extraction allowance from the REMAINING durable generation window: never more than the cap and never into the
  * protected verification reserve. Returns 0 (fail closed, no dispatch) when the reserve cannot be kept. */
 export const durableExtendedExtractionAllowance = (generationMs: number, timing: DurableStageTiming = DURABLE_EXTENDED_STAGE_TIMING) =>
-  Number.isFinite(generationMs) ? Math.max(0, Math.floor(Math.min(timing.extractionMs, generationMs - timing.verificationReserveMs))) : 0;
+  Number.isFinite(generationMs)
+    ? Math.max(0, Math.floor(Math.min(timing.extractionMs, generationMs - timing.verificationReserveMs - timing.betweenStagesMs))) : 0;
 
 /** Activated only by the isolated two-conversation test boundary. */
 export const CONTINUITY_TEST_TIMING = Object.freeze({

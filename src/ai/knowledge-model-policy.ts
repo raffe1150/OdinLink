@@ -5,6 +5,7 @@ import { isSourceExhaustiveProtocol, SOURCE_EXHAUSTIVE_V2_PROTOCOL } from './sou
 import type { UnifiedAiGenerationRequest } from './providers/provider';
 import { managedKnowledgeDefault } from './model-routing';
 import { ACCURACY_FIRST_POLICY, durableStageCapMs, knowledgeStageCapMs } from './knowledge-timing-policy';
+import { durableTiming, timeDurableWork } from '../p2/durable-knowledge-trace';
 
 export const KNOWLEDGE_SOL_PROFILE = 'sol-low-v1' as const;
 /** Extraction-only canary: Sol for extraction and one budget-owned re_extraction;
@@ -261,17 +262,17 @@ export function knowledgeStageOptions(profile: KnowledgeModelProfile, stage: str
   const now = Date.now();
   check(Number.isFinite(deadlineAt) && deadlineAt > now, 'deadline');
   check(stageCapMs === undefined || selection.durable === true && stageCapMs === durableStageCapMs(stage), 'stage_cap');
-  const permitDeadlineAt = stage === 'verification' && stageCapMs !== undefined ? Math.min(deadlineAt, now + stageCapMs) : deadlineAt;
+  const permitDeadlineAt = stageCapMs === undefined ? deadlineAt : Math.min(deadlineAt, now + stageCapMs);
   selection.used.add(stage as Stage);
   const permit = Object.freeze({ profile: profile.id, stage: stage as Stage });
   permits.set(permit, { selection, stage, deadlineAt: permitDeadlineAt, attempted: false, ...(stageCapMs !== undefined ? { stageCapMs } : {}) });
   return { model: 'gpt-6.1-sol', reasoningEffort: 'low', knowledgeExecution: permit };
 }
 
-/** Use the same absolute deadline for the host timer and the managed verifier. */
-export function durableVerificationDeadline(permit: KnowledgeExecutionPermit | undefined): number | undefined {
+/** The host and managed provider share a single deadline on extended durable turns. */
+export function durableManagedStageDeadline(permit: KnowledgeExecutionPermit | undefined): number | undefined {
   const state = permit && permits.get(permit);
-  return state?.stage === 'verification' && state.stageCapMs !== undefined ? state.deadlineAt : undefined;
+  return state?.stageCapMs === undefined ? undefined : state.deadlineAt;
 }
 
 function validRequest(request: UnifiedAiGenerationRequest, state: Permit) {
@@ -337,16 +338,18 @@ export async function executeKnowledgeGeneration<T>(request: UnifiedAiGeneration
   check(state && !state.attempted && !state.selection.failed, 'unowned_or_consumed_permit');
   state.attempted = true;
   const owner = state.selection.owner; check(owner, 'budget_owner_unavailable');
+  const timing = { stage: state.stage, correlationId: request.diagnosticContext?.correlationId };
   let quote: KnowledgeCostQuote | undefined, reservationId: string | null = null, settled = false, denied = false;
   try {
     validRequest(request, state);
     check(!owner.providerProjectId || !process.env.OPENAI_PROJECT_ID || process.env.OPENAI_PROJECT_ID === owner.providerProjectId, 'provider_project_mismatch');
     check(request.signal && !request.signal.aborted, 'cancellation');
-    // Extended verification was bounded when its permit was issued. Reservations and
-    // freshness checks consume that same deadline before the SDK sees its remainder.
-    const deadlineAt = durableVerificationDeadline(request.knowledgeExecution) ??
+    // Extended durable stages share the host deadline. Reservation and freshness
+    // checks consume that same window before the SDK sees its remainder.
+    const deadlineAt = durableManagedStageDeadline(request.knowledgeExecution) ??
       Math.min(state.deadlineAt, Date.now() + (state.stageCapMs ?? knowledgeStageCapMs(state.stage)));
-    const dispatchFloorMs = state.stage === 'verification' ? ACCURACY_FIRST_POLICY.verificationDispatchMs : 1;
+    const dispatchFloorMs = state.stage === 'verification' || state.stageCapMs !== undefined
+      ? ACCURACY_FIRST_POLICY.verificationDispatchMs : 1;
     check(deadlineAt - Date.now() >= dispatchFloorMs, 'dispatch_allowance');
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(Math.max(1, deadlineAt - Date.now()))]);
     check((params.max_output_tokens === undefined || params.max_output_tokens === 8192) &&
@@ -372,7 +375,8 @@ export async function executeKnowledgeGeneration<T>(request: UnifiedAiGeneration
       ...(owner.providerProjectId ? { providerProjectId: owner.providerProjectId } : {}),
       maximumRequestNanoUsd: owner.maximumRequestNanoUsd, maximumTurnNanoUsd: owner.maximumTurnNanoUsd });
     signal.throwIfAborted();
-    const receipt = await withinSignal(owner.reserve(quote, signal), signal);
+    const quoted = quote;
+    const receipt = await timeDurableWork('financial_reservation', () => withinSignal(owner.reserve(quoted, signal), signal), timing);
     denied = receipt === null;
     check(receipt, 'reservation_denied'); reservationId = receipt.id;
     check(typeof receipt.id === 'string' && receipt.id.length && receipt.reservationKey === quote.reservationKey && receipt.maximumNanoUsd === maximumNanoUsd, 'reservation_identity');
@@ -382,31 +386,60 @@ export async function executeKnowledgeGeneration<T>(request: UnifiedAiGeneration
     // sending its contents to a model.
     const sent: readonly KnowledgeRequestEvidence[] = Object.freeze((JSON.parse(request.messages[0].content).evidence as any[]).map(e =>
       Object.freeze({ id: String(e.id), businessId: e.businessId, text: String(e.text) })));
-    check(state.selection.current && await withinSignal(state.selection.current(sent), signal), 'source_or_turn_changed');
+    const current = state.selection.current;
+    check(current && await timeDurableWork('before_dispatch_authority',
+      () => withinSignal(current(sent), signal), timing), 'source_or_turn_changed');
     signal.throwIfAborted();
     check(deadlineAt - Date.now() >= dispatchFloorMs, 'dispatch_allowance');
     check(sha256Wire(wire) === requestSha256, 'wire_mutated');
     const admittedQuote = quote, admittedReservationId = reservationId;
-    const pendingResponse = send(wire, signal, deadlineAt - Date.now(), owner.providerProjectId);
+    const dispatchAt = Date.now();
+    const providerTimeoutMs = deadlineAt - dispatchAt;
+    durableTiming('provider_dispatch', { ...timing, deadlineAt, providerTimeoutMs,
+      requestBytes: inputTokenProxy - 2048, outputTokenLimit: 8192 });
+    const pendingResponse = send(wire, signal, providerTimeoutMs, owner.providerProjectId);
     // A late authentic receipt is a monetary fact only. Reconcile it outside
     // the expired customer operation; never revive the answer or permit a retry.
     // An uncertain/invalid late receipt keeps the full durable exposure.
     void pendingResponse.then(async late => {
+      const raw: Record<string, unknown> = object(late) ? late : {};
+      const usage = object(raw.usage) ? raw.usage : {};
+      const outputDetails = object(usage.output_tokens_details) ? usage.output_tokens_details : {};
+      const requestId = raw._request_id;
+      const responseId = raw.id;
+      durableTiming('provider_return', { ...timing, durationMs: Date.now() - dispatchAt, locallyAborted: signal.aborted,
+        providerRequestId: typeof requestId === 'string' && /^req_[a-z0-9_-]{1,120}$/iu.test(requestId) ? requestId : undefined,
+        providerResponseId: typeof responseId === 'string' && /^resp_[a-z0-9_-]{1,120}$/iu.test(responseId) ? responseId : undefined,
+        providerStatus: typeof raw.status === 'string' && ['completed','incomplete','failed','cancelled','in_progress','queued'].includes(raw.status) ? raw.status : undefined,
+        providerCreatedAt: integer(raw.created_at) ? Number(raw.created_at) : undefined,
+        providerCompletedAt: integer(raw.completed_at) ? Number(raw.completed_at) : undefined,
+        inputTokens: integer(usage.input_tokens) ? Number(usage.input_tokens) : undefined,
+        outputTokens: integer(usage.output_tokens) ? Number(usage.output_tokens) : undefined,
+        reasoningTokens: integer(outputDetails.reasoning_tokens) ? Number(outputDetails.reasoning_tokens) : undefined });
       if (!signal.aborted) return;
-      try { await owner.settle(admittedReservationId, admittedQuote, usageOf(late, admittedQuote, owner)); }
+      try { await timeDurableWork('late_financial_settlement',
+        () => owner.settle(admittedReservationId, admittedQuote, usageOf(late, admittedQuote, owner)), timing); }
       catch { try { await owner.retainUnknown(admittedQuote, admittedReservationId); } catch { /* Durable hold remains. */ } }
-    }, () => {});
+    }, error => {
+      const requestId: unknown = error?.requestID ?? error?.request_id;
+      durableTiming('provider_error', { ...timing, durationMs: Date.now() - dispatchAt, locallyAborted: signal.aborted,
+        providerRequestId: typeof requestId === 'string' && /^req_[a-z0-9_-]{1,120}$/iu.test(requestId) ? requestId : undefined });
+    });
     const response = await withinSignal(pendingResponse, signal);
     signal.throwIfAborted();
     const usage = usageOf(response, quote, owner);
-    await withinSignal(owner.settle(reservationId, quote, usage), signal);
+    await timeDurableWork('financial_settlement',
+      () => withinSignal(owner.settle(admittedReservationId, admittedQuote, usage), signal), timing);
     settled = true;
     signal.throwIfAborted();
     state.selection.settled.add(state.stage);
     return { response, usage };
   } catch (error) {
     state.selection.failed = true;
-    if (quote && !settled && !denied) await owner.retainUnknown(quote, reservationId);
+    if (quote && !settled && !denied) {
+      const admittedQuote = quote;
+      await timeDurableWork('retain_financial_hold', () => owner.retainUnknown(admittedQuote, reservationId), timing);
+    }
     throw error;
   }
 }

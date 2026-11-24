@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { DisposableNativeKnowledgeDatabase } from '../../tests/helpers/disposable-native-knowledge-db';
 import { SupabaseOrderedKnowledgeRepository } from './supabase-ordered-knowledge-repository';
 import { KnowledgeRunner, deliverKnowledge, type GuardedKnowledgeTransport } from './knowledge-runner';
+import { KnowledgeWorkerCycle } from './knowledge-worker-cycle';
 import { resultDigest, safeUnavailableKnowledge, type KnowledgeScope, type VerifiedKnowledge } from './knowledge-lifecycle';
 
 const dir = 'docs/designs/durable-knowledge-publication-migration-package';
@@ -95,6 +96,64 @@ test('guarded durable publication on disposable PostgreSQL 17', async t => {
     assert.equal(duplicate.result.acceptance!.task!.maxModelAttempts, 4);
   }
   assert.equal(sends, 6);
+
+  await t.test('controlled shutdown during claim waits for fenced relinquishment instead of lease expiry', async st => {
+    const f = await admit(conversation(3), 'en', 4);
+    const task = f.task!;
+    const claim = repo.claim.bind(repo);
+    let markCommitted!: () => void;
+    let returnClaim!: () => void;
+    const committed = new Promise<void>(resolve => { markCommitted = resolve; });
+    const finishClaim = new Promise<void>(resolve => { returnClaim = resolve; });
+    st.mock.method(repo, 'claim', async (...args: Parameters<typeof claim>) => {
+      const row = await claim(...args);
+      if (args[1] === task.id && args[2] === 'old-worker') {
+        assert.ok(row?.lease);
+        markCommitted();
+        await finishClaim;
+      }
+      return row;
+    });
+    const runner = new KnowledgeRunner(repo, async () => assert.fail('stopped worker entered execution'), 'old-worker');
+    const cycle = new KnowledgeWorkerCycle(repo, runner, transport, 'sender', { processing: () => true, delivery: () => false });
+    let finished = false;
+    const tick = cycle.tick().finally(() => { finished = true; });
+    const stopped = assert.rejects(tick, /knowledge_runner_stopped/u);
+    await committed;
+    const old = (await repo.get(f.scope, task.id))!;
+    cycle.stop();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(finished, false);
+    assert.equal(await runner.run(f.scope, task.id), null);
+    returnClaim();
+    await stopped;
+    const released = (await repo.get(f.scope, task.id))!;
+    assert.equal(released.lease, null);
+    assert.equal(released.modelAttempts, 0);
+    assert.equal(released.expiresAt, task.expiresAt);
+    const token = { taskId: task.id, fence: old.fence, owner: 'old-worker' };
+    assert.equal(await repo.ownsLease(f.scope, token), false);
+    assert.equal(await repo.renew(f.scope, token, 15_000), false);
+    assert.equal(await repo.reserveModelAttempt(f.scope, token), false);
+    assert.equal(await repo.verified(f.scope, token, complete), false);
+    assert.equal(await repo.finalize(f.scope, token), null);
+    const dueAt = Number(pg.sql(`select extract(epoch from knowledge_available_at)*1000 from odin_tasks where id='${task.id}';`));
+    assert.ok(dueAt < old.lease!.until - 10_000, 'reclaim is due well before the old lease would expire');
+    // Advance only the due marker in the isolated fixture, avoiding a real
+    // sleep and preserving the admitted timestamps and old lease comparison.
+    pg.sql(`update odin_tasks set knowledge_available_at=clock_timestamp() where id='${task.id}';`);
+    const next = new KnowledgeRunner(repo, async (_task, context) => {
+      assert.equal(await context.ownsLease!(), true);
+      await context.reserveModelAttempt();
+      return complete;
+    }, 'new-worker');
+    const delivery = (await next.run(f.scope, task.id))!;
+    assert.ok(delivery);
+    assert.equal((await repo.get(f.scope, task.id))!.fence, old.fence + 1);
+    assert.equal((await repo.get(f.scope, task.id))!.expiresAt, task.expiresAt);
+    assert.equal(await next.run(f.scope, task.id), null);
+    await repo.rejectDelivery(f.scope, task.id, delivery.id);
+  });
 
   const other = await admit(conversation(88), 'en');
   assert.equal(other.task!.maxModelAttempts, 4);

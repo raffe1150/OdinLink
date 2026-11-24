@@ -363,6 +363,12 @@ const visitChecklistQuestionBoundary = new RegExp([
   coordinatedQuestionBoundary.source,
   String.raw`\s+och\s+(?=hur\s+(?:hittar|tar)\s+(?:jag|vi|man)(?![\p{L}\p{M}]))`,
 ].join('|'), 'giu');
+// A comma followed by an explicit Swedish wh-question in a visit checklist
+// introduces a separate request, even when all questions share one final '?'.
+const commaVisitQuestionBoundary = new RegExp([
+  visitChecklistQuestionBoundary.source,
+  String.raw`,\s+(?=hur\s+(?:hittar|tar)\s+(?:jag|vi|man)(?![\p{L}\p{M}]))`,
+].join('|'), 'giu');
 // A yes/no necessity question. Wh-questions ("how many minutes before must I…")
 // stay descriptive: they ask for the business fact, not a binary obligation.
 const necessityQuestion = /^(?:¿\s*)?(?:(?:do|does)\s+(?:i|we|one)\s+(?:need|have)\s+to|(?:must|need)\s+(?:i|we)|is\s+it\s+(?:necessary|required|mandatory)|(?:behöver|måste)\s+(?:jag|vi|man)|är\s+det\s+(?:nödvändigt|obligatoriskt|ett\s+(?:krav|måste))|(?:muss|müssen|brauche|brauchen)\s+(?:ich|wir|man)|ist\s+es\s+(?:nötig|notwendig|erforderlich|pflicht)|(?:necesito|necesitamos|debo|debemos|tengo\s+que|hay\s+que|es\s+(?:necesario|obligatorio)))(?![\p{L}\p{M}])|^آیا\s+(?:لازم|باید|ضروری|اجباری|الزامی)|^هل\s+(?:يجب|يلزم|أحتاج|احتاج|نحتاج|يتعين|عل[يىَّ]+|من\s+الضروري)/iu;
@@ -390,7 +396,8 @@ export function contextualCompoundInformationPlan(question: string, recognized: 
   const asked = rest.match(/[^?؟]+[?؟]/gu) || [];
   if (asked.join('') !== rest) return null;
   const spans: string[] = [];
-  const questionBoundary = asked.length > 1 ? visitChecklistQuestionBoundary : coordinatedQuestionBoundary;
+  const questionBoundary = asked.length > 1 ? visitChecklistQuestionBoundary
+    : /,\s+hur\s+(?:hittar|tar)\s+(?:jag|vi|man)\b/iu.test(rest) ? commaVisitQuestionBoundary : coordinatedQuestionBoundary;
   for (const part of asked) {
     let start = 0;
     for (const boundary of part.matchAll(questionBoundary)) {

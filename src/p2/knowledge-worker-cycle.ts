@@ -69,7 +69,9 @@ export class KnowledgeWorkerCycle {
       // Keep the reentry guard until every owned branch settles; preserve errors.
       for (const outcome of outcomes) if (outcome.status === 'rejected') throw outcome.reason;
       return { ran: true, deliveries: reports };
-      },{signal:this.abort.signal,timeoutMs:this.cycleMs()});
+      // Stop cancels individual runs/sends. Keep the cycle pending while they
+      // relinquish leases or settle transport outcomes during host shutdown.
+      },{timeoutMs:this.cycleMs()});
     } finally { this.busy = false; }
   }
 }

@@ -8,7 +8,7 @@ import { randomUUID } from 'node:crypto';
 import OpenAI from 'openai';
 import { FakeKnowledgeDatabase, FakeKnowledgeLifecycle } from '../../tests/helpers/fake-knowledge-lifecycle';
 import { ScriptedKnowledgeBudgetOwner } from '../../tests/helpers/knowledge-budget-owner';
-import { configureKnowledgeBudgetOwner, durableVerificationDeadline, knowledgeStageOptions, captureKnowledgeModelProfile } from '../ai/knowledge-model-policy';
+import { configureKnowledgeBudgetOwner, durableManagedStageDeadline, knowledgeStageOptions, captureKnowledgeModelProfile, type KnowledgeCostQuote } from '../ai/knowledge-model-policy';
 import { ACCURACY_FIRST_POLICY, DURABLE_EXTENDED_STAGE_TIMING, accuracyFirstExtractionAllowance, durableExtendedExtractionAllowance,
   durableStageCapMs, knowledgeStageCapMs } from '../ai/knowledge-timing-policy';
 import { DurableKnowledgeBudget } from './durable-knowledge-budget';
@@ -29,7 +29,8 @@ afterEach(() => { b.reset(); configureKnowledgeBudgetOwner(); });
 type Channel = KnowledgeScope['channel'];
 type Plan = { preMs?: number; windowMs?: number; extractionMs?: number; verificationMs?: number; publicationV2?: boolean; businessId?: number;
   betweenStagesMs?: number; verificationReservationMs?: number;
-  heartbeat?: boolean; extraction?: 'ok' | 'drop' | 'interrupt' | 'steal' | 'revise'; channel?: Channel };
+  heartbeat?: boolean; extraction?: 'ok' | 'drop' | 'interrupt' | 'steal' | 'revise' | 'stop_after_hold' | 'late_receipt'; channel?: Channel;
+  question?: string; language?: string };
 const FACT = 'Parking is in the courtyard behind the studio.';
 const QUESTION = 'Where can I park my car when visiting the studio?';
 
@@ -49,7 +50,7 @@ function verifier(data: any) {
 async function harness(t: TestContext, plan: Plan) {
   for (const level of ['log', 'warn', 'info', 'error'] as const) t.mock.method(console, level, () => {});
   const businessId = plan.businessId ?? 3, channel = plan.channel ?? 'telegram';
-  const owner = new ScriptedKnowledgeBudgetOwner(); owner.businessIds = [businessId]; configureKnowledgeBudgetOwner(owner);
+  const owner = new ScriptedKnowledgeBudgetOwner(); owner.businessIds = [businessId];
   let revision = 'v1';
   const decisions: Record<string, unknown>[] = [];
   b.configure({
@@ -62,7 +63,7 @@ async function harness(t: TestContext, plan: Plan) {
   const db = new FakeKnowledgeDatabase(), repo = new FakeKnowledgeLifecycle(db, () => Date.now(), async () => true);
   const scope: KnowledgeScope = { businessId, channel, providerAccount: 'account', conversationId: randomUUID() };
   const eventId = randomUUID();
-  const accepted = await repo.accept(scope, eventId, { question: QUESTION, language: 'en', history: [] },
+  const accepted = await repo.accept(scope, eventId, { question: plan.question ?? QUESTION, language: plan.language ?? 'en', history: [] },
     { executionMs: plan.windowMs ?? 75_000, maxModelAttempts: 4 });
   const taskId = accepted.task!.id;
   if (plan.publicationV2 ?? true) (db.rows.tasks.get(taskId) as any).publicationV2 = true; // persisted admission field (fixture)
@@ -80,6 +81,16 @@ async function harness(t: TestContext, plan: Plan) {
   }
   const calls: { stage: string; timeoutMs: number; generationRemainingMs: number; outcome: string }[] = [];
   let runner: KnowledgeRunner | undefined;
+  let returnReceipt: () => void = () => assert.fail('No pending receipt');
+  if (plan.extraction === 'stop_after_hold') {
+    const reserve = owner.reserve.bind(owner);
+    t.mock.method(owner, 'reserve', async (quote: KnowledgeCostQuote, signal: AbortSignal) => {
+      const receipt = await reserve(quote, signal);
+      if (receipt && quote.stage === 'extraction') { heartbeatStopped = true; runner!.stop(); }
+      return receipt;
+    });
+  }
+  configureKnowledgeBudgetOwner(owner);
   t.mock.method(OpenAI.Responses.prototype, 'create', async function (wire: any, options: any) {
     const instructions = String(wire.instructions);
     const stage = wire.text?.format?.name === 'odinlink_knowledge_source_exhaustive_v2' || /ENTAILMENT/u.test(instructions) ? 'verification' : 'extraction';
@@ -89,6 +100,11 @@ async function harness(t: TestContext, plan: Plan) {
     calls.push(record);
     const data = JSON.parse(wire.input[0].content);
     if (stage === 'extraction') {
+      if (plan.extraction === 'late_receipt') {
+        heartbeatStopped = true;
+        runner!.stop();
+        await new Promise<void>(resolve => { returnReceipt = resolve; });
+      }
       if (plan.extraction === 'drop') { advance(5_000); record.outcome = 'connection_lost'; throw new Error('socket hang up'); }
       if (plan.extraction === 'interrupt') { advance(5_000); record.outcome = 'worker_stopped'; heartbeatStopped = true; runner!.stop(); throw options.signal.reason ?? new Error('aborted'); }
       if (plan.extraction === 'steal') { advance(16_000); await repo.claim(scope, taskId, 'worker-2', 15_000); }
@@ -118,7 +134,7 @@ async function harness(t: TestContext, plan: Plan) {
     },
   }, config, async () => true), name);
   const run = async (name = 'worker') => { runner = makeRunner(name); return runner.run(scope, taskId); };
-  return { db, repo, scope, taskId, eventId, owner, calls, decisions, run, advance, task: () => repo.get(scope, taskId) };
+  return { db, repo, scope, taskId, eventId, owner, calls, decisions, run, advance, returnReceipt: () => returnReceipt(), task: () => repo.get(scope, taskId) };
 }
 const safeText = safeUnavailableKnowledge('en').text;
 const transport = (sends: string[], outcome: 'ok' | 'ambiguous' = 'ok'): GuardedKnowledgeTransport => ({
@@ -133,7 +149,7 @@ test('policy: async-only constants; foreground caps unchanged', () => {
   assert.deepEqual([ACCURACY_FIRST_POLICY.extractionMs, ACCURACY_FIRST_POLICY.verificationMs, ACCURACY_FIRST_POLICY.verificationReserveMs], [20_000, 19_999, 12_000]);
   assert.equal(accuracyFirstExtractionAllowance(53_500), 20_000);
   assert.deepEqual([durableExtendedExtractionAllowance(53_500), durableExtendedExtractionAllowance(40_000), durableExtendedExtractionAllowance(22_000),
-    durableExtendedExtractionAllowance(Number.NaN)], [30_000, 18_000, 0, 0]);
+    durableExtendedExtractionAllowance(Number.NaN)], [29_500, 16_000, 0, 0]);
   const task = (windowMs: number, publicationV2: boolean, businessId = 3) => ({ acceptedAt: 1_000, expiresAt: 1_000 + windowMs, publicationV2,
     scope: { businessId }, maxModelAttempts: 4, modelAttempts: 0 }) as any;
   const signal = new AbortController().signal, reserve = async () => {};
@@ -153,7 +169,7 @@ test('permit: a durable stage cap is refused for a non-durable selection and for
   assert.throws(() => knowledgeStageOptions(durable, 'verification', binding, Date.now() + 40_000, 19_999), /stage_cap/);
   const now = Date.now();
   const permit = knowledgeStageOptions(durable, 'verification', binding, now + 40_000, 22_000).knowledgeExecution;
-  assert.ok(durableVerificationDeadline(permit)! >= now + 22_000 && durableVerificationDeadline(permit)! <= Date.now() + 22_000);
+  assert.ok(durableManagedStageDeadline(permit)! >= now + 22_000 && durableManagedStageDeadline(permit)! <= Date.now() + 22_000);
   const foreground = captureKnowledgeModelProfile({ ...base, turnId: 'f', nativeForeground: true, durable: false },
     { ODINLINK_KNOWLEDGE_MODEL_PROFILE: 'off', ODINLINK_AI_DEFAULT_MODEL: 'gpt-6.1-sol' } as any);
   if (foreground.id !== 'default') assert.throws(() => knowledgeStageOptions(foreground, 'extraction', { ...binding, turnId: 'f' }, Date.now() + 1_000, 30_000), /stage_cap/);
@@ -173,8 +189,8 @@ for (const channel of ['telegram', 'whatsapp', 'instagram', 'messenger'] as cons
     assert.deepEqual(h.owner.events, ['reserve', 'settle', 'reserve', 'settle']);
   });
 
-test('verification near its deadline: slow pre-work and slow extraction still leave the verifier its full cap', async t => {
-  const h = await harness(t, { preMs: 12_000, extractionMs: 24_000, verificationMs: 19_500 });
+test('verification near its deadline: extraction preserves both the verifier and the inter-stage margin', async t => {
+  const h = await harness(t, { preMs: 10_000, extractionMs: 24_000, verificationMs: 19_500 });
   const delivery = await h.run();
   assert.deepEqual(h.calls.map(c => c.outcome), ['completed', 'completed']);
   assert.ok(h.calls[0].timeoutMs <= h.calls[0].generationRemainingMs - 22_000 + 1, `extraction ${h.calls[0].timeoutMs}`);
@@ -259,6 +275,53 @@ test('no room for the verification reserve: zero Sol dispatch, zero reservation,
   const delivery = await h.run();
   assert.deepEqual(h.calls, []); assert.equal(h.owner.reservations.size, 0);
   assert.equal(delivery?.text, safeText);
+});
+
+test('incident replay: 16 s unexpected handoff shrinks the old extraction window to about 10.172 s; new admission avoids futile dispatch', async t => {
+  const h = await harness(t, { preMs: 10_328, heartbeat: false, extractionMs: 20_943, language: 'sv',
+    question: 'Jag ska besöka AdMotion Studio för första gången. Hur tidigt bör jag komma, hur hittar jag till entrén och är det ett krav att komma tidigare?' });
+  const initial = (await h.task())!;
+  const old = (await h.repo.claim(h.scope, h.taskId, '9sphf', 15_000))!;
+  assert.equal(await h.repo.claim(h.scope, h.taskId, 'j4z8z', 15_000), null);
+  h.advance(16_000);
+  const generationRemaining = knowledgeExecutionDeadline(initial) - 1_500 - Date.now();
+  const oldAllowance = Math.min(30_000, generationRemaining - 22_000);
+  assert.ok(oldAllowance > 9_900 && oldAllowance <= 10_172, `old allowance ${oldAllowance}`);
+  const delivery = await h.run('j4z8z');
+  const recovered = (await h.task())!;
+  assert.equal(recovered.expiresAt, initial.expiresAt);
+  assert.equal(recovered.fence, old.fence + 1);
+  assert.deepEqual(h.calls, []);
+  assert.deepEqual(h.owner.events, []);
+  assert.equal(recovered.modelAttempts, 0);
+  assert.equal(delivery?.text, safeUnavailableKnowledge('sv').text);
+  const denial = h.decisions.find(event => event.stage === 'extraction' && event.reason === 'STAGE_ADMISSION');
+  assert.ok(denial && Number(denial.timeoutMs) < 8_300, JSON.stringify(denial));
+});
+
+test('shutdown after a financial reservation retains the hold and recovery cannot dispatch that stage', async t => {
+  const h = await harness(t, { extraction: 'stop_after_hold' });
+  await assert.rejects(h.run('worker-1'));
+  assert.deepEqual(h.calls, []);
+  assert.deepEqual([...h.owner.reservations.values()].map(r => !!r.unknown), [true]);
+  h.advance(16_000);
+  assert.equal((await h.run('worker-2'))?.text, safeText);
+  assert.deepEqual(h.calls, []);
+  assert.deepEqual(h.owner.events, ['reserve', 'retainUnknown']);
+  assert.equal(h.db.rows.deliveries.size, 1);
+});
+
+test('a late provider receipt settles the original hold without reviving publication', async t => {
+  const h = await harness(t, { extraction: 'late_receipt' });
+  await assert.rejects(h.run('worker-1'));
+  assert.deepEqual([...h.owner.reservations.values()].map(r => !!r.unknown), [true]);
+  h.returnReceipt();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.ok([...h.owner.reservations.values()].every(r => r.cost !== undefined));
+  assert.equal(h.db.rows.deliveries.size, 0);
+  h.advance(16_000);
+  assert.equal((await h.run('worker-2'))?.text, safeText);
+  assert.equal(h.calls.length, 1);
 });
 
 test('worker interrupted mid-extraction (outcome unknown): hold kept, recovery never re-dispatches, one safe reply', async t => {

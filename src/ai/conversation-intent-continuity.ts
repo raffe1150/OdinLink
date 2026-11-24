@@ -45,7 +45,7 @@ export function hasConversationReference(text: string): boolean {
   if (hasArabicObjectReference(text)) return true;
   // In Swedish arrival-policy questions, dummy "det" introduces the explicit
   // action after "att". Ignore only that pronoun in the reference probe.
-  const probe = text.replace(/(^|[.!?؟]\s*)(är\s+)det(?=\s+(?:ett\s+(?:krav|måste)|en\s+rekommendation|nödvändigt|obligatoriskt|rekommenderat)\s+att\s+(?![^.!?؟]*\b(?:dit|hit)\b)(?:komma|anlända|vara\s+på\s+plats|infinna\s+sig)(?![\p{L}\p{M}]))/giu, '$1$2');
+  const probe = text.replace(/(^|[.!?؟]\s*|(?:,|\boch)\s+)(är\s+)det(?=\s+(?:ett\s+(?:krav|måste)|en\s+rekommendation|nödvändigt|obligatoriskt|rekommenderat)\s+att\s+(?![^.!?؟]*\b(?:dit|hit)\b)(?:komma|anlända|vara\s+på\s+plats|infinna\s+sig)(?![\p{L}\p{M}]))/giu, '$1$2');
   return /(?<![\p{L}\p{M}])(?:it|that|there|this|them|same\s+place|det|den|där|samma\s+plats|das|dort|demselben\s+ort|eso|all[ií]|mismo\s+lugar|آنجا|آن|همان\s+مکان|هناك|ذلك|نفس\s+المكان)(?![\p{L}\p{M}])/iu.test(probe);
 }
 

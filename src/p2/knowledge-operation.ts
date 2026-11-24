@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { KnowledgeTask } from './knowledge-lifecycle';
+import { timeDurableWork } from './durable-knowledge-trace';
 
 export const KNOWLEDGE_OPERATION_LIMITS = Object.freeze({ databaseMs:3000, eligibilityMs:5000, sendMs:5000, cycleMs:60000, deliveryMs:15000 });
 const scope=new AsyncLocalStorage<{signal:AbortSignal;deadlineAt:number}>();
@@ -46,5 +47,6 @@ export async function knowledgeOperation<T>(work:(signal:AbortSignal)=>PromiseLi
   }
 }
 export function knowledgeDatabaseRead<T=any>(query:any):Promise<T> {
-  return knowledgeOperation(signal=>typeof query.abortSignal==='function'?query.abortSignal(signal):query);
+  return timeDurableWork('database_operation', () =>
+    knowledgeOperation<T>(signal=>typeof query.abortSignal==='function'?query.abortSignal(signal):query));
 }

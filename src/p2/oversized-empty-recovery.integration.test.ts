@@ -6,6 +6,7 @@ import { InMemoryKnowledgeStorage, KnowledgeService, knowledgeSourceRevision, ty
 import type { SourceLanguage } from '../knowledge/semantic-queries';
 import { admitted, readySources } from '../../tests/helpers/admotion-current-inventory';
 import { answerEvidence } from '../ai/business-information-answer-plan';
+import { compactKnowledgeVerifierInput } from '../ai/knowledge-verifier-input';
 import { accuracyFirstExtractionAllowance, ACCURACY_FIRST_POLICY, durableStageCapMs } from '../ai/knowledge-timing-policy';
 import { SOL_REEXTRACTION_MIN_MS } from '../ai/sol-extraction-canary';
 import { DisposableNativeKnowledgeDatabase } from '../../tests/helpers/disposable-native-knowledge-db';
@@ -37,6 +38,7 @@ type Mode = 'ok' | 'ordinary-empty' | 'malformed' | 'refused' | 'truncated' | 'r
 const oversizedEmpty = { oversized: true, units: [] };
 const questionSv = 'Jag ska besöka AdMotion Studio för första gången. Hur tidigt bör jag komma och hur hittar jag till entrén?';
 const arrivalPolicyQuestionSv = questionSv + ' Är det ett krav att komma tidigare eller bara en rekommendation?';
+const incidentQuestionSv = 'Jag ska besöka AdMotion Studio för första gången. Hur tidigt bör jag komma, hur hittar jag till entrén och är det ett krav att komma tidigare?';
 const factsSv = [
   'Förstagångsbesökare rekommenderas att komma cirka 10 minuter före sin bokade tid.',
   'Entrén ligger på innergården.',
@@ -272,6 +274,7 @@ test('managed durable oversized-empty recovery through native intake and Postgre
     if (mode === 'other-protocol') process.env.ODINLINK_KNOWLEDGE_VERIFIER_PROTOCOL = 'v2';
     let activeStage: KnowledgeSolStage | undefined;
     const diagnostics: Record<string, unknown>[] = [];
+    const timing: Record<string, unknown>[] = [];
     const summaries: any[] = [], decisions: any[] = [];
     const wires: any[] = [];
     let original: { content: string; schema: unknown } | undefined;
@@ -283,6 +286,9 @@ test('managed durable oversized-empty recovery through native intake and Postgre
         const stage = activeStage!;
         assert.ok(stage);
         const wire = JSON.parse(String(options?.body));
+        const clientId = new Headers(options?.headers).get('x-client-request-id');
+        if (foreground) assert.equal(clientId, null);
+        else assert.match(clientId ?? '', /^[a-f0-9-]{36}$/u);
         const content = wire.input[0].content, data = JSON.parse(content);
         assert.equal(wire.model, 'gpt-6.1-sol');
         assert.equal(wire.max_output_tokens, 8192);
@@ -371,6 +377,7 @@ test('managed durable oversized-empty recovery through native intake and Postgre
             'synthetic-successor', { atMs: Math.floor(Date.now() / 1000) * 1000, sequence: serial + 1 });
           assert.equal(successor.disposition, 'ACCEPTED');
         }
+        if (stage === 'extraction' && mode === 'repair-time') st.mock.method(Date, 'now', () => now() + 10_000);
         return response({ object: 'response', id: `resp_fixture_${calls.length}`, model: wire.model, status, service_tier: wire.service_tier,
           reasoning: wire.reasoning, prompt_cache_options: wire.prompt_cache_options, output: [{ type: 'message', content: [output] }],
           usage: { input_tokens: 500, output_tokens: 200, input_tokens_details: { cached_tokens: 0, cache_write_tokens: 0 } } });
@@ -403,6 +410,7 @@ test('managed durable oversized-empty recovery through native intake and Postgre
     st.mock.method(console, 'info', (label, body) => {
       if (label === '[EvidenceFirstKnowledge]') summaries.push(JSON.parse(body));
       if (label === '[EvidenceFirstDecision]') decisions.push(JSON.parse(body));
+      if (label === '[DurableKnowledgeTiming]') timing.push(JSON.parse(body));
     });
     const connection: ResolvedChannelConnection = {
       id: `connection-${channel}`, businessId: 3, provider: channel, providerAccountId: providerAccount,
@@ -452,7 +460,7 @@ test('managed durable oversized-empty recovery through native intake and Postgre
       return channel === 'instagram' ? b.instagramInbound(input, cfg) : b.messengerInbound(input, cfg);
     };
     await inbound();
-    if (foreground) return { calls, quotes, task: null, outbox: [], posts, failures, unknown: [], diagnostics, wires, summaries, decisions };
+    if (foreground) return { calls, quotes, task: null, outbox: [], posts, failures, unknown: [], diagnostics, wires, summaries, decisions, timing };
     const accepted = JSON.parse(pg.sql('SELECT to_jsonb(t) FROM odin_tasks t ORDER BY created_at DESC LIMIT 1;'));
     taskId = accepted.id;
     conversationId = accepted.conversation_id;
@@ -462,11 +470,10 @@ test('managed durable oversized-empty recovery through native intake and Postgre
     assert.equal(accepted.knowledge_max_models, 4);
     assert.equal(Date.parse(accepted.knowledge_expires_at) - Date.parse(accepted.knowledge_accepted_at), 75_000);
     // Age a fixture only in this disposable cluster. Preserve its 75-second window.
-    // Durable extended stage budget: generation remaining = 75 - age - 15 (lifecycle) - 1.5 (publication) s;
-    // extraction allowance = min(30, remaining - 22). 'time' (45 s) leaves ~13.5 s: no extraction can keep the
-    // verifier's reserve, so nothing is dispatched or reserved. 'repair-time' (32 s) leaves ~26.5 s: extraction gets
-    // ~4.5 s, then re_extraction (needs >= 8 s after the same reserve) is skipped for the deadline.
-    const ageSeconds = mode === 'time' ? 45 : mode === 'repair-time' ? 32 : mode === 'expired' ? 76 : variant === 'lexical' && mode === 'ok' ? 23 : 0;
+    // The repair case starts with enough allowance for extraction, then the
+    // scripted response consumes 10 seconds so another extraction cannot start.
+    const ageSeconds = mode === 'time' ? 45 : mode === 'repair-time' ? 18 : mode === 'expired' ? 76
+      : variant === 'lexical' && mode === 'ok' && !partial ? 18 : 0;
     if (ageSeconds) pg.sql(`SET session_replication_role = replica;
       UPDATE odin_tasks SET knowledge_expires_at = statement_timestamp() + interval '${75 - ageSeconds} seconds',
       knowledge_accepted_at = statement_timestamp() - interval '${ageSeconds} seconds' WHERE id = '${taskId}';`);
@@ -478,7 +485,7 @@ test('managed durable oversized-empty recovery through native intake and Postgre
       await runtime.tick();
     }
     const outbox = JSON.parse(pg.sql(`SELECT coalesce(jsonb_agg(knowledge_state),'[]'::jsonb) FROM odin_outbox WHERE knowledge_task_id = '${taskId}';`));
-    return { calls, quotes, task: task(), outbox, posts, failures, diagnostics, wires, summaries, decisions,
+    return { calls, quotes, task: task(), outbox, posts, failures, diagnostics, wires, summaries, decisions, timing,
       unknown: [...owner.reservations.values()].filter(r => r.unknown).map(r => r.quote.stage) };
   }
 
@@ -660,6 +667,44 @@ test('managed durable oversized-empty recovery through native intake and Postgre
       const accepted = result.decisions.find(event => event.reason === 'SOURCE_COVERAGE_ACCEPTED');
       assert.equal(accepted?.sourceCoverage.state, 'COMPLETE');
       assert.deepEqual(accepted.sourceCoverage.evidenceInventory, { expected: 5, reviewed: 5, missing: 0, unexpected: 0, duplicate: 0 });
+    });
+    await t.test(`Durable ${channel}: November 24 wording covers all three obligations through the native adapter`, async st => {
+      const result = await run(st, [channel, 'sv', incidentQuestionSv, factsSv], 'ok', 'lexical', { kind: 'arrival-policy' });
+      assert.deepEqual(result.failures, []);
+      assert.deepEqual(result.calls, ['extraction', 'verification']);
+      assert.deepEqual(result.outbox, ['SENT']);
+      assert.equal(result.posts.length, 1);
+      for (const fact of sixFirstVisitFacts) assert.ok(result.posts[0].includes(fact.text), fact.text);
+      assert.equal(result.task.knowledge_result.independentlyVerified, true);
+      const turn = result.timing.filter(event => event.turnId === result.task.knowledge_turn_id);
+      assert.deepEqual(turn.find(event => event.phase === 'plan_result')?.obligations, 3);
+      for (const phase of ['intake_begin', 'attachment', 'worker_claimed', 'execution_preflight', 'planning',
+        'retrieval_total', 'database_operation', 'model_attempt_reservation', 'financial_reservation', 'stage_window',
+        'provider_dispatch', 'provider_return', 'financial_settlement', 'persist_result', 'finalize', 'channel_dispatch', 'channel_return',
+        'delivery_transport_result'])
+        assert.ok(turn.some(event => event.phase === phase), phase);
+      assert.ok(!JSON.stringify(turn).includes('AdMotion'));
+      for (const event of turn.filter(event => event.phase === 'provider_dispatch')) {
+        const window = turn.find(x => x.phase === 'stage_window' && x.correlationId === event.correlationId);
+        assert.equal(window?.stageDeadlineAt, event.deadlineAt);
+      }
+      if (channel === 'telegram') {
+        // Measure a counterfactual only. The managed request sent above used
+        // the current authority envelope and the strict source-exhaustive schema.
+        const wire = result.wires[1];
+        const data = JSON.parse(wire.input[0].content);
+        assert.equal(typeof data.authoritativeEvidence, 'string');
+        const candidate = compactKnowledgeVerifierInput(data) as typeof data;
+        assert.deepEqual({ ...candidate, authoritativeEvidence: JSON.stringify(candidate.authoritativeEvidence) }, data);
+        const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+        const candidateWire = { ...wire, input: [{ ...wire.input[0], content: JSON.stringify(candidate) }] };
+        const before = bytes(wire), after = bytes(candidateWire);
+        assert.ok(after < before);
+        st.diagnostic(JSON.stringify({ extractionWireBytes: bytes(result.wires[0]), verificationWireBytes: before,
+          flattenedVerificationWireBytes: after, savingsBytes: before - after,
+          evidenceBytes: bytes(data.evidence), candidateUnitsBytes: bytes(data.units),
+          authorityBytes: bytes(data.authoritativeEvidence), instructionsBytes: bytes(wire.instructions), schemaBytes: bytes(wire.text) }));
+      }
     });
   }
 

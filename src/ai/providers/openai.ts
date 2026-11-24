@@ -5,6 +5,7 @@ import type { EmbeddingVector } from "../embeddings";
 import { buildOpenAiFailureDiagnostic } from "./openai-diagnostic";
 import { normalizeOpenAiToolSchema } from "./openai-tool-schema";
 import { executeKnowledgeGeneration, type KnowledgeUsage } from '../knowledge-model-policy';
+import { hasDurableTrace, trackDurableProviderWork } from '../../p2/durable-knowledge-trace';
 import { isKnowledgeStageSchema, modelDescriptor, modelStageFor, RESERVATION_REQUIRED_STAGES, routeDefaultModel, type ModelRoute } from '../model-routing';
 import { consumeNaturalAdmission } from '../natural-composer-budget';
 import type {
@@ -231,9 +232,12 @@ export async function generateWithOpenAi(
     if (request.knowledgeExecution) {
       if (process.env.OPENAI_BASE_URL && process.env.OPENAI_BASE_URL.replace(/\/$/u, '') !== 'https://api.openai.com/v1')
         throw new Error('knowledge_sol_endpoint_mismatch');
-      const result = await executeKnowledgeGeneration(request, params, (wire, signal, timeout, projectId) =>
+      const clientRequestId = request.diagnosticContext?.correlationId;
+      const correlate = hasDurableTrace() && clientRequestId && /^[a-f0-9-]{36}$/u.test(clientRequestId);
+      const result = await trackDurableProviderWork(executeKnowledgeGeneration(request, params, (wire, signal, timeout, projectId) =>
         client.responses.create(wire as unknown as OpenAI.Responses.ResponseCreateParamsNonStreaming, { signal, timeout, maxRetries: 0,
-          ...(projectId ? { headers: { 'OpenAI-Project': projectId } } : {}) }));
+          ...(projectId || correlate ? { headers: { ...(projectId ? { 'OpenAI-Project': projectId } : {}),
+            ...(correlate ? { 'X-Client-Request-Id': clientRequestId } : {}) } } : {}) })));
       response = result.response; knowledgeUsage = result.usage;
     } else if(trialEnforced()) response=await executeTrialRequest('language',params,{signal:request.signal,timeoutMs:20000},
       (wire,signal,timeout,project)=>client.responses.create(wire as unknown as OpenAI.Responses.ResponseCreateParamsNonStreaming,{signal,timeout,maxRetries:0,headers:{'OpenAI-Project':project}}));

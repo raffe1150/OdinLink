@@ -33,7 +33,8 @@ import { NativeKnowledgeRuntime, nativeAsyncControls, type NativeKnowledgeAdmiss
 import { nativeKnowledgeOrder, type NativeKnowledgeOrder } from './src/p2/native-knowledge-order';
 import { bindBusinessInformationTurnId } from './src/ai/business-information-timing';
 import { DurableKnowledgeBudget } from './src/p2/durable-knowledge-budget';
-import { knowledgeOperation } from './src/p2/knowledge-operation';
+import { knowledgeDatabaseRead, knowledgeOperation } from './src/p2/knowledge-operation';
+import { durableTiming, timeDurableWork } from './src/p2/durable-knowledge-trace';
 import { captureVerified, type KnowledgeTask, type VerifiedKnowledge } from './src/p2/knowledge-lifecycle';
 import type { KnowledgeExecutor } from './src/p2/knowledge-runner';
 import { prepareLiteralTurn, type SharedTurnExecutionResult, hasConversationReference, hasExternalConversationReference, continuesReferenceClarification, referenceClarificationReply, mixedActionClarificationReply } from './src/ai/conversation-intent-continuity';
@@ -53,7 +54,7 @@ import { selectSemanticQueries, retainPlannedQueryLanguages, explicitlyWrongWork
 import { RequestSecurity, immutable } from './src/knowledge/request-security';
 import { ANSWER_LIMITS, InformationBudget, INFORMATION_PUBLICATION_RESERVE_MS, parseRequestedFacets, answerEvidence, answerEvidenceBindings, buildEvidenceFirstAnswer, narrowInformationRequest, withinInformationDeadline, pruneAnswerManifest, completeKnowledgeManifest, publishableKnowledgeManifest, type Facet, type Evidence, type AnswerManifest } from './src/ai/business-information-answer-plan';
 import { KNOWLEDGE_SCHEMA_VERSION, verificationAdmissionDiagnostic, knowledgeDiagnosticFailure, knowledgeStructuredOutput, knowledgeFailureReason, safeModelIdentifier, selectKnowledgeVerificationProtocol, selectKnowledgeExtractionProtocol, type KnowledgeExtractionProtocol, type KnowledgeVerificationProtocol, type KnowledgeDecision, type DecisionReason, type KnowledgeStage } from './src/ai/knowledge-answer-protocol';
-import { captureKnowledgeModelProfile, durableVerificationDeadline, knowledgeNaturalBinding, sentEvidenceCurrent, knowledgeStageOptions, solExtractionMode, solExtractionEligible, KNOWLEDGE_SOL_EXTRACTION_PROFILE, KNOWLEDGE_SOL_PRODUCTION_PROFILE, knowledgeManagedStages, type KnowledgeModelProfile, type KnowledgeExecutionPermit } from './src/ai/knowledge-model-policy';
+import { captureKnowledgeModelProfile, durableManagedStageDeadline, knowledgeNaturalBinding, sentEvidenceCurrent, knowledgeStageOptions, solExtractionMode, solExtractionEligible, KNOWLEDGE_SOL_EXTRACTION_PROFILE, KNOWLEDGE_SOL_PRODUCTION_PROFILE, knowledgeManagedStages, type KnowledgeModelProfile, type KnowledgeExecutionPermit } from './src/ai/knowledge-model-policy';
 import { emitSolCanaryTelemetry, extractionReasonCounts, reExtractionAdmission, runSolExtractionShadow, type SolStageRecord } from './src/ai/sol-extraction-canary';
 import { generateWithOpenAi } from './src/ai/providers/openai';
 import { assertDefaultModelConfiguration, describeDefaultModel, modelStageFor, routeNaturalComposerModels } from './src/ai/model-routing';
@@ -978,15 +979,15 @@ async function generateContentWithFallback(ai: GoogleGenAI | null, options: {
   const isKnowledgeVerification = options.context?.stage === 'knowledge_units_verification';
   // Durable extended tasks only (DurableKnowledgeBudget.stageTiming); foreground and other durable tasks are unchanged.
   const durableStageTiming = durableBudget?.stageTiming;
-  const extendedVerificationDeadlineAt = durableStageTiming && isKnowledgeVerification
-    ? durableVerificationDeadline(options.knowledgeExecution) : undefined;
+  const extendedStageDeadlineAt = durableStageTiming
+    ? durableManagedStageDeadline(options.knowledgeExecution) : undefined;
   const proposalAllowance = knowledgeProposal ? (informationBudget.nativeTiming ? accuracyFirstExtractionAllowance(informationBudget.generationRemaining(), informationBudget.nativeTiming.policy)
     : durableStageTiming ? durableExtendedExtractionAllowance(informationBudget.generationRemaining(), durableStageTiming)
     : knowledgeProposalAllowance(informationBudget.generationRemaining())) : null;
   // Managed Knowledge extraction/verification only: the native turn's provider floor (production 0, so AI_PROVIDER_TIMEOUT_MS applies unchanged;
   // only the scoped fa Sol-to-Sol experiment profile raises it to its 45 s stage allowance).
   const managedKnowledgeStage = ['knowledge_units_extraction', 'knowledge_units_re_extraction', 'knowledge_units_verification'].includes(options.context?.stage || '');
-  // Durable extraction uses the extended provider floor. The extended verifier uses its absolute permit deadline below.
+  // Extended managed calls use their absolute permit deadline below.
   const knowledgeProviderTimeoutMs = informationBudget?.nativeTiming && managedKnowledgeStage
     ? Math.max(providerTimeoutMs, informationBudget.nativeTiming.policy.knowledgeProviderFloorMs)
     : durableStageTiming && managedKnowledgeStage && !isKnowledgeVerification
@@ -1008,20 +1009,33 @@ async function generateContentWithFallback(ai: GoogleGenAI | null, options: {
   const informationStageLimit = proposalAllowance ?? (isKnowledgePlanning
     ? Math.min(planningLimit,providerTimeoutMs) : ['knowledge_units_composition','knowledge_units_presentation_verification'].includes(options.context?.stage || '') && informationBudget
     ? Math.max(1, Math.min(2_000, informationBudget.generationRemaining())) : knowledgeProviderTimeoutMs);
-  const timeoutMs = extendedVerificationDeadlineAt !== undefined ? Math.max(0, extendedVerificationDeadlineAt - Date.now())
+  const timeoutMs = extendedStageDeadlineAt !== undefined ? Math.max(0, extendedStageDeadlineAt - Date.now())
     : informationBudget ? Math.min(knowledgeProviderTimeoutMs, informationStageLimit, informationBudget.generationRemaining()) : options.context?.stage === "business_information_completeness_repair"
     ? Math.min(5_000, providerTimeoutMs) : providerTimeoutMs;
-  const stageDeadlineAt = extendedVerificationDeadlineAt ?? Date.now() + timeoutMs;
+  const stageDeadlineAt = extendedStageDeadlineAt ?? Date.now() + timeoutMs;
   recordKnowledgePolicyStage('queued', timeoutMs);
+  const assertDurableExtractionAdmission = (checkpoint: 'before_queue' | 'after_queue' | 'after_reservation') => {
+    if (!durableStageTiming || !managedKnowledgeStage || isKnowledgeVerification) return;
+    const remainingMs = Math.max(0, stageDeadlineAt - Date.now());
+    const admitted = remainingMs >= durableStageTiming.extractionDispatchMs;
+    durableTiming('extraction_admission', { checkpoint, correlationId, remainingMs, admitted });
+    if (!admitted) throw new Error('information_proposal_admission');
+  };
+  if (managedKnowledgeStage) durableTiming('stage_window', {
+    stage: options.context?.stage, correlationId, stageDeadlineAt, timeoutMs,
+    generationRemainingMs: informationBudget?.generationRemaining(), executionDeadlineAt: durableBudget?.executionDeadlineAt,
+  });
+  assertDurableExtractionAdmission('before_queue');
   const assertVerificationAdmission = (checkpoint: 'before_queue' | 'after_queue') => {
     if (!informationBudget || !isKnowledgeVerification) return;
     const remaining = informationBudget.remaining();
-    const useStageDeadline = extendedVerificationDeadlineAt !== undefined || informationBudget.nativeTiming;
+    const useStageDeadline = extendedStageDeadlineAt !== undefined || informationBudget.nativeTiming;
     const stageRemaining = checkpoint === 'before_queue' ? timeoutMs : Math.max(0, stageDeadlineAt - Date.now());
     const reserve = informationBudget.publicationReserveMs;
     const admission = verificationAdmissionDiagnostic(useStageDeadline ? Math.min(remaining, stageRemaining + reserve) : remaining,
       reserve, useStageDeadline ? ACCURACY_FIRST_POLICY.verificationDispatchMs : KNOWLEDGE_VERIFICATION_MIN_MS, checkpoint);
     emitKnowledgeDecision({ stage: 'verification', reason: admission.admitted ? 'ACCEPTED' : 'STAGE_ADMISSION', admission });
+    durableTiming('verification_admission', { checkpoint, correlationId, admitted: admission.admitted, stageRemaining });
     if (!admission.admitted) throw new Error('information_verification_admission');
   };
   assertVerificationAdmission('before_queue');
@@ -1067,6 +1081,7 @@ async function generateContentWithFallback(ai: GoogleGenAI | null, options: {
         scopedTiming?.assertProcessing();
         if (informationBudget && !informationBudget.remaining()) throw new Error("information_deadline");
         if (informationBudget && !informationBudget.generationRemaining()) throw new Error("information_publication_reserve");
+        assertDurableExtractionAdmission('after_queue');
         assertVerificationAdmission('after_queue');
         if (informationBudget instanceof DurableKnowledgeBudget) {
           if (!informationBudget.remaining()) throw new Error('information_deadline');
@@ -1076,6 +1091,7 @@ async function generateContentWithFallback(ai: GoogleGenAI | null, options: {
           // Durable reservation is an async database boundary. Reapply the same
           // admission floor after it, before any verifier request is submitted.
           assertVerificationAdmission('after_queue');
+          assertDurableExtractionAdmission('after_reservation');
           signal = AbortSignal.any([...(signal ? [signal] : []), informationBudget.signal]);
         }
         try {
@@ -1094,6 +1110,9 @@ async function generateContentWithFallback(ai: GoogleGenAI | null, options: {
       }, () => {
         attemptTimings.get(attempt)!.executionStartedAt = Date.now();
         recordKnowledgePolicyStage('dispatch', Math.max(0, stageDeadlineAt - Date.now()), Date.now() - attemptTimings.get(attempt)!.queuedAt);
+        if (managedKnowledgeStage) durableTiming('model_queue_exit', {
+          stage: options.context?.stage, correlationId, durationMs: Date.now() - attemptTimings.get(attempt)!.queuedAt,
+        });
         logVerifierTiming(attempt, "provider_start");
         if (options.context?.businessInfoTurnId) {
           runOptionalDiagnostic(() => console.info('[BusinessInformationProviderTiming]', {
@@ -1114,6 +1133,8 @@ async function generateContentWithFallback(ai: GoogleGenAI | null, options: {
     },
     onAttemptComplete: (event) => {
       recordKnowledgePolicyStage('settled', Math.max(0, stageDeadlineAt - Date.now()));
+      if (managedKnowledgeStage) durableTiming('stage_result', { stage: options.context?.stage, correlationId,
+        category: event.category, ok: event.ok, durationMs: event.durationMs, stageDeadlineAt });
       if(informationBudget) emitKnowledgeDecision({stage:knowledgeProviderStage(options.context?.stage),reason:event.ok?'ACCEPTED':knowledgeFailureReason({category:event.category}),
         ...(event.category?{failureCategory:event.category}:{}),
         ...(event.category==='TIMEOUT'?{timeoutScope:informationBudget.generationRemaining()>0?'stage' as const:'request' as const}:{}),
@@ -5577,7 +5598,7 @@ function getNativeKnowledgeRuntime():NativeKnowledgeRuntime|null {
   if (!hostedNativeKnowledge) hostedNativeKnowledge=new NativeKnowledgeRuntime({db:supabase,secret:process.env.P2_CONVERSATION_KEY_SECRET||'',controls:nativeAsyncControls,
     diagnostic:event=>console.log('[AsyncKnowledge]',event),
     execute:async(task,context,current)=>{
-      const {data,error}=await supabase!.from('businesses').select('*').eq('id',task.scope.businessId).maybeSingle();
+      const {data,error}=await knowledgeDatabaseRead(supabase!.from('businesses').select('*').eq('id',task.scope.businessId).maybeSingle());
       if(error || !data || Number(data.id)!==task.scope.businessId) throw new Error('knowledge_business_scope_unavailable');
       return executeDurableKnowledgeTask(task,context,normalizeBusinessConfig(data),current);
     }});
@@ -6064,7 +6085,8 @@ async function generateNativeKnowledgeContent(sessionId:string,options:any,suppo
         if (trialEnforced()&&!await trialCurrent()) return false;
         if (!await knowledgeOwnershipCurrent()) return false;
         const fresh = await currentAnswerEvidence();
-        return !state.freshnessFailure && sentEvidenceCurrent(sent, modelEvidenceSnapshot, fresh, state.businessId!) && await knowledgeOwnershipCurrent();
+        return !state.freshnessFailure && sentEvidenceCurrent(sent, modelEvidenceSnapshot, fresh, state.businessId!) &&
+          await knowledgeOwnershipCurrent() && (!durablePublication || await state.ownsDurableLease?.() === true);
       },
     }) });
     const cancellationEvidence = nativeKnowledgeTiming() && !state.naturalEnabled && !(state.budget instanceof DurableKnowledgeBudget) &&
@@ -6101,7 +6123,11 @@ async function generateNativeKnowledgeContent(sessionId:string,options:any,suppo
       generationRemainingMs: state.budget!.generationRemaining(), attempts: state.budget!.attempts,
       maxAttempts: durableBudget ? Math.min(4, durableBudget.maxAttempts) : ANSWER_LIMITS.attempts,
       // Admit only against the allowance the re_extraction permit will receive (durable extended: verification reserve kept).
-      ...(durableBudget?.stageTiming ? { extractionAllowance: (ms: number) => durableExtendedExtractionAllowance(ms, durableBudget.stageTiming!) } : {}) });
+      ...(durableBudget?.stageTiming ? { extractionAllowance: (ms: number) => {
+        const policy = durableBudget.stageTiming!;
+        const allowance = durableExtendedExtractionAllowance(ms, policy);
+        return allowance >= policy.extractionDispatchMs ? allowance : 0;
+      } } : {}) });
     const clarification = state.nativeChannel && nativeKnowledgeTiming() && !state.mixedRequest &&
       !state.requiresReferenceResolution && !state.unresolvedReference && options.knowledgePublication === 'guarded_text'
       ? serviceSelectionClarification(support.question, language) : undefined;
@@ -6171,11 +6197,18 @@ async function generateNativeKnowledgeContent(sessionId:string,options:any,suppo
           const durableBudget = state.budget instanceof DurableKnowledgeBudget ? state.budget : undefined;
           const durableStageTiming = durableBudget?.stageTiming;
           const stageCapMs = durableStageTiming ? durableStageCapMs(requestedStage, durableStageTiming) : undefined;
+          const extractionAllowance = stage === 'extraction' && durableStageTiming
+            ? durableExtendedExtractionAllowance(state.budget!.generationRemaining(), durableStageTiming) : undefined;
+          if (extractionAllowance !== undefined && extractionAllowance < durableStageTiming!.extractionDispatchMs) {
+            durableTiming('extraction_admission', { checkpoint: 'before_permit', stage: requestedStage,
+              remainingMs: extractionAllowance, admitted: false, generationRemainingMs: state.budget!.generationRemaining() });
+            emitKnowledgeDecision({ stage: 'extraction', reason: 'STAGE_ADMISSION', remainingMs: state.budget!.remaining(), timeoutMs: extractionAllowance });
+            throw new Error('information_proposal_admission');
+          }
           const stageDeadlineAt = stage === 'verification' && durableBudget && stageCapMs !== undefined
             ? Math.min(started + stageCapMs, durableBudget.executionDeadlineAt - durableBudget.publicationReserveMs)
             : Date.now() +
-            (stage === 'extraction' ? (durableStageTiming ? durableExtendedExtractionAllowance(state.budget!.generationRemaining(), durableStageTiming)
-                : accuracyFirstExtractionAllowance(state.budget!.generationRemaining(), state.budget!.nativeTiming?.policy))
+            (stage === 'extraction' ? (extractionAllowance ?? accuracyFirstExtractionAllowance(state.budget!.generationRemaining(), state.budget!.nativeTiming?.policy))
               : Math.min((state.budget!.nativeTiming?.policy ?? ACCURACY_FIRST_POLICY).verificationMs, state.budget!.generationRemaining()));
           const profileOptions = knowledgeStageOptions(state.modelProfile!, requestedStage, modelBinding, stageDeadlineAt, stageCapMs);
           sol = !!profileOptions.knowledgeExecution;
@@ -6280,8 +6313,8 @@ export async function executeDurableKnowledgeTask(task: KnowledgeTask,
     beginBusinessInformationTiming(sessionId, question, task.scope.businessId);
     try {
       await context.checkpoint('planning');
-      const retrievedKnowledge = await retrieveBusinessKnowledgeForQuestion(businessConfig, question,
-        businessInformationTimingContext(sessionId));
+      const retrievedKnowledge = await timeDurableWork('retrieval_total', () => retrieveBusinessKnowledgeForQuestion(businessConfig, question,
+        businessInformationTimingContext(sessionId)));
       await context.checkpoint('retrieval');
       if (state.unresolvedReference || state.oversized || !state.budget?.remaining() || budget.publicationV2 && !state.facets?.length) return null;
       businessInformationTurns[sessionId] = { savedAt: Date.now(), businessConfig, question: question,
@@ -9624,7 +9657,7 @@ async function retrieveBusinessKnowledgeForQuestion(
       ? priority1hTestDependencies?.knowledgeSourceLanguages?.(businessId) || Promise.resolve([])
       : knowledgeService.sourceLanguageHints(businessId,retrievalOptions)).catch(() => [] as SourceLanguage[]);
     const plan = () => Promise.all([
-      resolveSemanticKnowledgeQueries(normalizedQuestion, businessConfig, timingContext),
+      timeDurableWork('planning', () => resolveSemanticKnowledgeQueries(normalizedQuestion, businessConfig, timingContext)),
       inventory.then(complete=>{completeInventory=complete;return complete ? [] as SourceLanguage[] : sourceHints();}),
     ]);
     const [semanticPlan, sourceLanguages] = await (state?.budget ? withinInformationDeadline(state.budget, plan) : plan());
@@ -9636,6 +9669,8 @@ async function retrieveBusinessKnowledgeForQuestion(
     }
     if (state?.budget) {
       const planned = parseRequestedFacets(semanticPlan?.requestedFacets);
+      durableTiming('plan_result', { facets: planned.facets.length,
+        obligations: planned.facets.reduce((count, facet) => count + facet.obligations.length, 0), oversized: planned.oversized });
       // Backend-admitted cancellation policy stays native even if the planner
       // declines it. Empty/invalid facets fail closed in the native contract;
       // the model cannot escape its budget into legacy generation or grounding.

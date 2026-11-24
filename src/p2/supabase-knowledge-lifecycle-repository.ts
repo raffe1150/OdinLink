@@ -139,6 +139,17 @@ export class SupabaseKnowledgeLifecycleRepository implements KnowledgeLifecycleR
     return this.task(s, await this.transition(s, id, 'claim', { owner, leaseMs }));
   }
   async renew(s: KnowledgeScope, t: TaskToken, leaseMs: number) { boundedInteger(leaseMs, 1, 30000); return Boolean(await this.transition(s, t.taskId, 'renew', { ...this.token(t), leaseMs })); }
+  async ownsLease(s: KnowledgeScope, t: TaskToken): Promise<boolean> {
+    validateScope(s); uuid(t.taskId); requireId(t.owner);
+    // This checks only the live lease. Callers separately check current
+    // conversation authority and freshness before using the evidence.
+    const row = await this.result(this.db.from('odin_tasks').select('knowledge_lease_until,knowledge_expires_at')
+      .eq('business_id', s.businessId).eq('conversation_id', s.conversationId).eq('knowledge_channel', s.channel)
+      .eq('knowledge_account', s.providerAccount).eq('id', t.taskId).eq('task_type', 'knowledge_async_v1')
+      .eq('knowledge_state', 'RUNNING').eq('knowledge_owner', t.owner).eq('knowledge_fence', t.fence).maybeSingle());
+    const now = Date.now();
+    return Boolean(row?.knowledge_lease_until && date(row.knowledge_lease_until) > now && date(row.knowledge_expires_at) > now);
+  }
   async reserveModelAttempt(s: KnowledgeScope, t: TaskToken) { return Boolean(await this.transition(s, t.taskId, 'model_attempt', this.token(t))); }
   async checkpoint(s: KnowledgeScope, t: TaskToken, checkpoint: Checkpoint) { return Boolean(await this.transition(s, t.taskId, 'checkpoint', { ...this.token(t), checkpoint })); }
   async verified(s: KnowledgeScope, t: TaskToken, result: Parameters<KnowledgeLifecycleRepository['verified']>[2]) {

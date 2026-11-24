@@ -77,6 +77,7 @@ export interface KnowledgeLifecycleRepository {
   get(scope: KnowledgeScope, taskId: string): Promise<KnowledgeTask | null>;
   claim(scope: KnowledgeScope, taskId: string, owner: string, leaseMs: number): Promise<KnowledgeTask | null>;
   renew(scope: KnowledgeScope, token: TaskToken, leaseMs: number): Promise<boolean>;
+  ownsLease?(scope: KnowledgeScope, token: TaskToken): Promise<boolean>;
   reserveModelAttempt(scope: KnowledgeScope, token: TaskToken): Promise<boolean>;
   checkpoint(scope: KnowledgeScope, token: TaskToken, checkpoint: Checkpoint): Promise<boolean>;
   verified(scope: KnowledgeScope, token: TaskToken, result: VerifiedKnowledge): Promise<boolean>;
