@@ -1,6 +1,6 @@
-import { knowledgeOperation, KNOWLEDGE_OPERATION_LIMITS } from './knowledge-operation';
+import { knowledgeOperation, knowledgeOperationDeadline, KNOWLEDGE_OPERATION_LIMITS } from './knowledge-operation';
 import { runOptionalDiagnostic } from '../ai/business-information-timing';
-import type { ProviderRejection } from './knowledge-preflight-diagnostic';
+import { telegramPreflightFailed, type ProviderRejection, type TelegramPreflightMethod, type TelegramPreflightRead } from './knowledge-preflight-diagnostic';
 import type { ResolvedChannelConnection } from '../channels/connections/contracts';
 import type { DeliveryOutcome, KnowledgeTask, KnowledgeScope } from './knowledge-lifecycle';
 import { NativeKnowledgeBindings, validNativeRecipient } from './native-knowledge-binding';
@@ -9,19 +9,35 @@ const VERSION='v25.0'; // Match existing native send helpers, not a provider-ver
 const messageId=(v:unknown):v is string=>typeof v==='string' && /^[A-Za-z0-9:_.=+/-]{1,256}$/u.test(v);
 const unsent=(retryable=false,retryAfterMs?:number):DeliveryOutcome=>({kind:'DEFINITIVELY_UNSENT',retryable,...(retryAfterMs!==undefined?{retryAfterMs}:{})});
 const ambiguous=():DeliveryOutcome=>({kind:'AMBIGUOUS'});
-async function jsonRead(fetcher:typeof fetch,url:URL,token:string,signal:AbortSignal):Promise<any|null>{
+async function jsonRead(fetcher:typeof fetch,url:URL,token:string,signal:AbortSignal,read?:TelegramPreflightRead):Promise<any|null>{
   if(signal.aborted)throw new Error('knowledge_operation_stopped');
   const response=await fetcher(url,{method:'GET',redirect:'error',headers:{Authorization:`Bearer ${token}`},signal});
-  if(!response.ok)return null;const data=await response.json().catch(()=>null);return data?.error?null:data;
+  if (read) read.httpStatus = response.status;
+  if (!response.ok) {
+    if (read) read.failure = 'provider_rejection';
+    return null;
+  }
+  const data = await response.json().catch(error => {
+    if (read) read.bodyError = error;
+    return null;
+  });
+  if (read && (data?.error || data?.ok === false)) read.failure = 'provider_rejection';
+  return data?.error ? null : data;
 }
+const telegramId = (id: unknown) => typeof id === 'string' || typeof id === 'number';
 /** Fresh, read-only provider capability checks. No AI call or send. Unknown
  * response shapes/unsupported account products fail closed. No permission cache.
  */
 export async function nativeProviderEligible(bindings:NativeKnowledgeBindings,task:KnowledgeTask,fetcher:typeof fetch=fetch,
-  signal:AbortSignal=AbortSignal.timeout(5000), expected?:ResolvedChannelConnection, rejected?:(reason:ProviderRejection)=>unknown):Promise<boolean>{
+  signal:AbortSignal=AbortSignal.timeout(5000), expected?:ResolvedChannelConnection, rejected?:(reason:ProviderRejection)=>unknown,
+  diagnoseTelegram = false):Promise<boolean>{
   const callerSignal=signal;
+  const startedAt = Date.now();
+  let deadlineAt = startedAt + KNOWLEDGE_OPERATION_LIMITS.eligibilityMs;
+  let telegramRead: TelegramPreflightRead | undefined;
   try { return await knowledgeOperation(async boundedSignal=>{
   signal=boundedSignal;
+  deadlineAt = knowledgeOperationDeadline() ?? deadlineAt;
   const reject=(reason:ProviderRejection):false=>{runOptionalDiagnostic(()=>rejected?.(reason));return false;};
   const resolved=await bindings.resolve(task.scope);if(!resolved)return reject('BINDING_OR_CONNECTION');
   const {binding:b,connection:c}=resolved;
@@ -33,12 +49,29 @@ export async function nativeProviderEligible(bindings:NativeKnowledgeBindings,ta
     // their own rights/identity contract and are not silently treated as bots.
     if(c.providerConnectionId)return reject('TELEGRAM_CONNECTION_MODE');
     const api=(method:string,params:Record<string,string>={})=>{const u=new URL(`https://api.telegram.org/bot${token}/${method}`);for(const[k,v]of Object.entries(params))u.searchParams.set(k,v);return u;};
-    const me=await jsonRead(fetcher,api('getMe'),token,signal);
-    if(me?.ok!==true || String(me.result?.id)!==b.account || me.result?.is_bot!==true)return reject('TELEGRAM_BOT_IDENTITY');
-    const chat=await jsonRead(fetcher,api('getChat',{chat_id:b.recipient}),token,signal);
-    if(chat?.ok!==true || String(chat.result?.id)!==b.recipient || chat.result?.type!=='private')return reject('TELEGRAM_PRIVATE_CHAT');
-    const member=await jsonRead(fetcher,api('getChatMember',{chat_id:b.recipient,user_id:b.account}),token,signal);
-    return member?.ok===true && String(member.result?.user?.id)===b.account && ['member','administrator','creator'].includes(member.result?.status) || reject('TELEGRAM_MEMBERSHIP');
+    const check = async (method: TelegramPreflightMethod, reason: ProviderRejection, params: Record<string, string>,
+      eligible: (data: any) => boolean, wellFormed: (result: any) => boolean) => {
+      const read: TelegramPreflightRead | undefined = diagnoseTelegram ? { method } : undefined;
+      telegramRead = read;
+      const data = await jsonRead(fetcher, api(method, params), token, signal, read);
+      const allowed = eligible(data);
+      // Leave the in-flight method available to the outer deadline race.
+      if (read && !signal.aborted && Date.now() < deadlineAt) {
+        if (!allowed) runOptionalDiagnostic(() => telegramPreflightFailed(task.turnId, read, startedAt, deadlineAt,
+          read.failure ?? (data?.ok === true && wellFormed(data.result) ? 'eligibility_denial' : 'malformed_response'), read.bodyError));
+        telegramRead = undefined;
+      }
+      return allowed || reject(reason);
+    };
+    if (!await check('getMe', 'TELEGRAM_BOT_IDENTITY', {},
+      me => me?.ok === true && String(me.result?.id) === b.account && me.result?.is_bot === true,
+      result => telegramId(result?.id) && typeof result?.is_bot === 'boolean')) return false;
+    if (!await check('getChat', 'TELEGRAM_PRIVATE_CHAT', { chat_id: b.recipient },
+      chat => chat?.ok === true && String(chat.result?.id) === b.recipient && chat.result?.type === 'private',
+      result => telegramId(result?.id) && typeof result?.type === 'string')) return false;
+    return await check('getChatMember', 'TELEGRAM_MEMBERSHIP', { chat_id: b.recipient, user_id: b.account },
+      member => member?.ok === true && String(member.result?.user?.id) === b.account && ['member', 'administrator', 'creator'].includes(member.result?.status),
+      result => telegramId(result?.user?.id) && typeof result?.status === 'string');
   }
   if(Date.now()-eventAt>=86400000)return reject('RESPONSE_WINDOW'); // Only standard customer-response windows; no tags/templates/extensions.
   const host=b.channel==='instagram'?'graph.instagram.com':'graph.facebook.com';
@@ -102,7 +135,10 @@ export async function nativeProviderEligible(bindings:NativeKnowledgeBindings,ta
   }) && Date.now()-eventAt<86400000 || reject('META_CONVERSATION_OR_WINDOW');
   },{signal,timeoutMs:KNOWLEDGE_OPERATION_LIMITS.eligibilityMs});
   } catch(error) {
-    if(callerSignal.aborted || (error as Error)?.message==='knowledge_operation_stopped')return false;
+    const stopped = callerSignal.aborted || (error as Error)?.message === 'knowledge_operation_stopped';
+    if (telegramRead) telegramPreflightFailed(task.turnId, telegramRead, startedAt, deadlineAt,
+      stopped ? (Date.now() >= deadlineAt ? 'timeout' : 'cancelled') : 'unexpected_exception', error);
+    if (stopped) return false;
     throw error;
   }
 }
