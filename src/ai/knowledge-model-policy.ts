@@ -258,13 +258,22 @@ export function knowledgeStageOptions(profile: KnowledgeModelProfile, stage: str
   check(stage !== 're_extraction' || selection.managed.has('re_extraction'), 'stage_unsupported');
   check(!selection.failed && !selection.used.has(stage as Stage), 'stage_already_closed');
   check(stage !== 're_extraction' || selection.settled.has('extraction'), 're_extraction_without_extraction');
-  check(Number.isFinite(deadlineAt) && deadlineAt > Date.now(), 'deadline');
+  const now = Date.now();
+  check(Number.isFinite(deadlineAt) && deadlineAt > now, 'deadline');
   check(stageCapMs === undefined || selection.durable === true && stageCapMs === durableStageCapMs(stage), 'stage_cap');
+  const permitDeadlineAt = stage === 'verification' && stageCapMs !== undefined ? Math.min(deadlineAt, now + stageCapMs) : deadlineAt;
   selection.used.add(stage as Stage);
   const permit = Object.freeze({ profile: profile.id, stage: stage as Stage });
-  permits.set(permit, { selection, stage, deadlineAt, attempted: false, ...(stageCapMs !== undefined ? { stageCapMs } : {}) });
+  permits.set(permit, { selection, stage, deadlineAt: permitDeadlineAt, attempted: false, ...(stageCapMs !== undefined ? { stageCapMs } : {}) });
   return { model: 'gpt-6.1-sol', reasoningEffort: 'low', knowledgeExecution: permit };
 }
+
+/** Use the same absolute deadline for the host timer and the managed verifier. */
+export function durableVerificationDeadline(permit: KnowledgeExecutionPermit | undefined): number | undefined {
+  const state = permit && permits.get(permit);
+  return state?.stage === 'verification' && state.stageCapMs !== undefined ? state.deadlineAt : undefined;
+}
+
 function validRequest(request: UnifiedAiGenerationRequest, state: Permit) {
   check(request.model === 'gpt-6.1-sol' && request.reasoningEffort === 'low', 'model_identity');
   const schema = request.structuredOutput;
@@ -333,9 +342,10 @@ export async function executeKnowledgeGeneration<T>(request: UnifiedAiGeneration
     validRequest(request, state);
     check(!owner.providerProjectId || !process.env.OPENAI_PROJECT_ID || process.env.OPENAI_PROJECT_ID === owner.providerProjectId, 'provider_project_mismatch');
     check(request.signal && !request.signal.aborted, 'cancellation');
-    // Production: 20000 / 19999 (accuracy-first-v1). Only an active experiment timing scope raises the cap.
-    // Durable extended tasks carry their own validated stage cap; everything else keeps the foreground policy cap.
-    const deadlineAt = Math.min(state.deadlineAt, Date.now() + (state.stageCapMs ?? knowledgeStageCapMs(state.stage)));
+    // Extended verification was bounded when its permit was issued. Reservations and
+    // freshness checks consume that same deadline before the SDK sees its remainder.
+    const deadlineAt = durableVerificationDeadline(request.knowledgeExecution) ??
+      Math.min(state.deadlineAt, Date.now() + (state.stageCapMs ?? knowledgeStageCapMs(state.stage)));
     const dispatchFloorMs = state.stage === 'verification' ? ACCURACY_FIRST_POLICY.verificationDispatchMs : 1;
     check(deadlineAt - Date.now() >= dispatchFloorMs, 'dispatch_allowance');
     const signal = AbortSignal.any([request.signal, AbortSignal.timeout(Math.max(1, deadlineAt - Date.now()))]);

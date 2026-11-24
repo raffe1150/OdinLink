@@ -6,7 +6,7 @@ import { InMemoryKnowledgeStorage, KnowledgeService, knowledgeSourceRevision, ty
 import type { SourceLanguage } from '../knowledge/semantic-queries';
 import { admitted, readySources } from '../../tests/helpers/admotion-current-inventory';
 import { answerEvidence } from '../ai/business-information-answer-plan';
-import { accuracyFirstExtractionAllowance, ACCURACY_FIRST_POLICY } from '../ai/knowledge-timing-policy';
+import { accuracyFirstExtractionAllowance, ACCURACY_FIRST_POLICY, durableStageCapMs } from '../ai/knowledge-timing-policy';
 import { SOL_REEXTRACTION_MIN_MS } from '../ai/sol-extraction-canary';
 import { DisposableNativeKnowledgeDatabase } from '../../tests/helpers/disposable-native-knowledge-db';
 import { ScriptedKnowledgeBudgetOwner } from '../../tests/helpers/knowledge-budget-owner';
@@ -261,8 +261,10 @@ test('managed durable oversized-empty recovery through native intake and Postgre
       if (quote.stage === 're_extraction' && mode === 'changed-after-hold') changeSource();
       if (quote.stage === 're_extraction' && mode === 'fenced-after-hold')
         pg.sql(`UPDATE odin_tasks SET knowledge_fence = knowledge_fence + 1 WHERE id = '${taskId}';`);
-      if (quote.stage === 'verification' && mode === 'late-verification')
-        st.mock.method(Date, 'now', () => now() + 11_000);
+      if (quote.stage === 'verification' && mode === 'late-verification') {
+        const delay = durableStageCapMs('verification') - ACCURACY_FIRST_POLICY.verificationDispatchMs + 250;
+        st.mock.method(Date, 'now', () => now() + delay);
+      }
       return receipt;
     });
     configureKnowledgeBudgetOwner(owner);

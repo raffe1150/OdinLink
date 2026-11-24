@@ -96,17 +96,15 @@ export const accuracyFirstExtractionAllowance = (generationMs: number, policy: K
  * (ODINLINK_ASYNC_KNOWLEDGE_EXTENDED_TENANTS). Every value is an upper bound; each stage is ALSO bounded by the task's
  * persisted execution deadline (expiresAt - 15 s lifecycle reserve) minus the 1.5 s publication reserve.
  * - extractionMs 30 s: the foreground 20 s cap was observed too short for Sol Extraction (2026-11-23 21:14).
- * - verificationMs 19.999 s: the existing Sol verification cap, unchanged.
- * - verificationReserveMs 22 s: Extraction may never consume the verifier's full cap plus ~2 s of inter-stage
- *   lifecycle work (extraction checkpoint, evidence recheck, durable attempt and monetary reservations), so a
- *   verifier that needs more than 16.5 s (2026-11-23 19:52) still has its full cap after a slow extraction.
+ * - verificationReserveMs 22 s: reserved against extraction and also the ceiling for independent verification.
+ *   Time spent between stages reduces the remaining generation budget available to the verifier.
  * Model, money limits, reservation keys, attempts and unknown-dispatch handling are unaffected. */
 export const DURABLE_EXTENDED_STAGE_TIMING = Object.freeze({
-  version: 'durable-extended-stages-v1', windowMs: 75_000, extractionMs: 30_000, verificationMs: 19_999, verificationReserveMs: 22_000 });
+  version: 'durable-extended-stages-v1', windowMs: 75_000, extractionMs: 30_000, verificationReserveMs: 22_000 });
 export type DurableStageTiming = typeof DURABLE_EXTENDED_STAGE_TIMING;
 /** Per-request cap of a managed Sol stage under the durable policy (re_extraction is an extraction). */
 export const durableStageCapMs = (stage: string, timing: DurableStageTiming = DURABLE_EXTENDED_STAGE_TIMING): number =>
-  stage === 'verification' ? timing.verificationMs : timing.extractionMs;
+  stage === 'verification' ? timing.verificationReserveMs : timing.extractionMs;
 /** Extraction allowance from the REMAINING durable generation window: never more than the cap and never into the
  * protected verification reserve. Returns 0 (fail closed, no dispatch) when the reserve cannot be kept. */
 export const durableExtendedExtractionAllowance = (generationMs: number, timing: DurableStageTiming = DURABLE_EXTENDED_STAGE_TIMING) =>

@@ -8,9 +8,9 @@ import { randomUUID } from 'node:crypto';
 import OpenAI from 'openai';
 import { FakeKnowledgeDatabase, FakeKnowledgeLifecycle } from '../../tests/helpers/fake-knowledge-lifecycle';
 import { ScriptedKnowledgeBudgetOwner } from '../../tests/helpers/knowledge-budget-owner';
-import { configureKnowledgeBudgetOwner, knowledgeStageOptions, captureKnowledgeModelProfile } from '../ai/knowledge-model-policy';
+import { configureKnowledgeBudgetOwner, durableVerificationDeadline, knowledgeStageOptions, captureKnowledgeModelProfile } from '../ai/knowledge-model-policy';
 import { ACCURACY_FIRST_POLICY, DURABLE_EXTENDED_STAGE_TIMING, accuracyFirstExtractionAllowance, durableExtendedExtractionAllowance,
-  knowledgeStageCapMs } from '../ai/knowledge-timing-policy';
+  durableStageCapMs, knowledgeStageCapMs } from '../ai/knowledge-timing-policy';
 import { DurableKnowledgeBudget } from './durable-knowledge-budget';
 import { knowledgeExecutionDeadline } from './knowledge-operation';
 import { KnowledgeRunner, deliverKnowledge, type GuardedKnowledgeTransport } from './knowledge-runner';
@@ -28,6 +28,7 @@ afterEach(() => { b.reset(); configureKnowledgeBudgetOwner(); });
 
 type Channel = KnowledgeScope['channel'];
 type Plan = { preMs?: number; windowMs?: number; extractionMs?: number; verificationMs?: number; publicationV2?: boolean; businessId?: number;
+  betweenStagesMs?: number; verificationReservationMs?: number;
   heartbeat?: boolean; extraction?: 'ok' | 'drop' | 'interrupt' | 'steal' | 'revise'; channel?: Channel };
 const FACT = 'Parking is in the courtyard behind the studio.';
 const QUESTION = 'Where can I park my car when visiting the studio?';
@@ -50,7 +51,9 @@ async function harness(t: TestContext, plan: Plan) {
   const businessId = plan.businessId ?? 3, channel = plan.channel ?? 'telegram';
   const owner = new ScriptedKnowledgeBudgetOwner(); owner.businessIds = [businessId]; configureKnowledgeBudgetOwner(owner);
   let revision = 'v1';
+  const decisions: Record<string, unknown>[] = [];
   b.configure({
+    evidenceFirstDecisionDiagnostic: (event: Record<string, unknown>) => decisions.push(event),
     knowledgeSearch: async () => [{ businessId, sourceId: 'doc', text: FACT, score: 1, metadata: { source: 'document', documentRevision: revision } }],
     semanticKnowledgeSearch: async () => [], validateKnowledgeMatches: async (_id: any, matches: any) => matches.map((m: any) => ({ ...m, metadata: { ...m.metadata, documentRevision: revision } })),
     calendarAdapter: { getCalendarId: () => 'unused', getEvents: async () => assert.fail('No Booking reads'), insertAppointment: async () => assert.fail('No Booking'),
@@ -68,6 +71,13 @@ async function harness(t: TestContext, plan: Plan) {
     for (const task of db.rows.tasks.values()) if (task.lease && task.lease.until > Date.now())
       task.lease = { ...task.lease, until: Math.min(Date.now() + 15_000, task.expiresAt) }; };
   const advance = (ms: number) => { for (let left = ms; left > 0; left -= 5_000) { skew += Math.min(5_000, left); heartbeat(); } };
+  if (plan.verificationReservationMs) {
+    const reserve = repo.reserveModelAttempt.bind(repo);
+    t.mock.method(repo, 'reserveModelAttempt', async (...args: Parameters<typeof reserve>) => {
+      if (db.rows.tasks.get(taskId)?.modelAttempts === 1) advance(plan.verificationReservationMs!);
+      return reserve(...args);
+    });
+  }
   const calls: { stage: string; timeoutMs: number; generationRemainingMs: number; outcome: string }[] = [];
   let runner: KnowledgeRunner | undefined;
   t.mock.method(OpenAI.Responses.prototype, 'create', async function (wire: any, options: any) {
@@ -100,9 +110,15 @@ async function harness(t: TestContext, plan: Plan) {
   });
   const config = { id: businessId, businessId, businessName: 'Synthetic studio', language: 'en', timezone: 'Europe/Stockholm', services: [] };
   skew += plan.preMs ?? 5_000; // intake -> worker start (foreground routing, poll, claim), counted against the persisted window
-  const makeRunner = (name: string) => new KnowledgeRunner(repo, (task, context) => executeDurableKnowledgeTask(task, context, config, async () => true), name);
+  const makeRunner = (name: string) => new KnowledgeRunner(repo, (task, context) => executeDurableKnowledgeTask(task, {
+    ...context,
+    checkpoint: async stage => {
+      if (stage === 'extraction' && plan.betweenStagesMs) advance(plan.betweenStagesMs);
+      await context.checkpoint(stage);
+    },
+  }, config, async () => true), name);
   const run = async (name = 'worker') => { runner = makeRunner(name); return runner.run(scope, taskId); };
-  return { db, repo, scope, taskId, eventId, owner, calls, run, advance, task: () => repo.get(scope, taskId) };
+  return { db, repo, scope, taskId, eventId, owner, calls, decisions, run, advance, task: () => repo.get(scope, taskId) };
 }
 const safeText = safeUnavailableKnowledge('en').text;
 const transport = (sends: string[], outcome: 'ok' | 'ambiguous' = 'ok'): GuardedKnowledgeTransport => ({
@@ -113,6 +129,7 @@ const transport = (sends: string[], outcome: 'ok' | 'ambiguous' = 'ok'): Guarded
 
 test('policy: async-only constants; foreground caps unchanged', () => {
   assert.equal(knowledgeStageCapMs('extraction'), 20_000); assert.equal(knowledgeStageCapMs('verification'), 19_999);
+  assert.equal(durableStageCapMs('verification'), 22_000);
   assert.deepEqual([ACCURACY_FIRST_POLICY.extractionMs, ACCURACY_FIRST_POLICY.verificationMs, ACCURACY_FIRST_POLICY.verificationReserveMs], [20_000, 19_999, 12_000]);
   assert.equal(accuracyFirstExtractionAllowance(53_500), 20_000);
   assert.deepEqual([durableExtendedExtractionAllowance(53_500), durableExtendedExtractionAllowance(40_000), durableExtendedExtractionAllowance(22_000),
@@ -133,6 +150,10 @@ test('permit: a durable stage cap is refused for a non-durable selection and for
   const durable = captureKnowledgeModelProfile({ ...base, nativeForeground: false, durable: true, durablePublicationV2: true }, {});
   assert.throws(() => knowledgeStageOptions(durable, 'extraction', binding, Date.now() + 1_000, 45_000), /stage_cap/);
   assert.equal(knowledgeStageOptions(durable, 'extraction', binding, Date.now() + 1_000, 30_000).model, 'gpt-6.1-sol');
+  assert.throws(() => knowledgeStageOptions(durable, 'verification', binding, Date.now() + 40_000, 19_999), /stage_cap/);
+  const now = Date.now();
+  const permit = knowledgeStageOptions(durable, 'verification', binding, now + 40_000, 22_000).knowledgeExecution;
+  assert.ok(durableVerificationDeadline(permit)! >= now + 22_000 && durableVerificationDeadline(permit)! <= Date.now() + 22_000);
   const foreground = captureKnowledgeModelProfile({ ...base, turnId: 'f', nativeForeground: true, durable: false },
     { ODINLINK_KNOWLEDGE_MODEL_PROFILE: 'off', ODINLINK_AI_DEFAULT_MODEL: 'gpt-6.1-sol' } as any);
   if (foreground.id !== 'default') assert.throws(() => knowledgeStageOptions(foreground, 'extraction', { ...binding, turnId: 'f' }, Date.now() + 1_000, 30_000), /stage_cap/);
@@ -146,7 +167,7 @@ for (const channel of ['telegram', 'whatsapp', 'instagram', 'messenger'] as cons
     const [extraction, verification] = h.calls;
     assert.ok(extraction.timeoutMs > 25_000 && extraction.timeoutMs <= 30_000, `extraction timeout ${extraction.timeoutMs}`);
     assert.ok(extraction.timeoutMs <= extraction.generationRemainingMs - DURABLE_EXTENDED_STAGE_TIMING.verificationReserveMs, 'verification reserve kept');
-    assert.ok(verification.timeoutMs <= 19_999 && verification.timeoutMs <= verification.generationRemainingMs + 1);
+    assert.ok(verification.timeoutMs <= 22_000 && verification.timeoutMs <= verification.generationRemainingMs + 1);
     assert.equal(delivery?.text, FACT); assert.equal((await h.task())?.state, 'FINALIZED'); assert.equal(h.db.rows.deliveries.size, 1);
     assert.equal((await h.task())?.modelAttempts, 2);
     assert.deepEqual(h.owner.events, ['reserve', 'settle', 'reserve', 'settle']);
@@ -161,13 +182,67 @@ test('verification near its deadline: slow pre-work and slow extraction still le
   assert.equal(delivery?.text, FACT);
 });
 
+// 23.503 s of extraction allowance at about 13 s into the 75 s task. The
+// extraction, checkpoint/freshness gap, and second reservation then consume
+// roughly 23.3 s, leaving about 22.181 s of generation budget at reservation.
+const observedTiming = { preMs: 12_997, extractionMs: 20_943, betweenStagesMs: 1_924, verificationReservationMs: 455 };
+
+for (const [label, extraMs] of [['22 s cap', 0], ['generation cutoff', 900]] as const)
+  test(`observed extraction timing: verifier succeeds after 20 s within the ${label}`, async t => {
+    const h = await harness(t, { ...observedTiming, betweenStagesMs: observedTiming.betweenStagesMs + extraMs, verificationMs: 20_500 });
+    const delivery = await h.run();
+    assert.deepEqual(h.calls.map(c => [c.stage, c.outcome]), [['extraction', 'completed'], ['verification', 'completed']]);
+    const [extraction, verification] = h.calls;
+    assert.ok(extraction.timeoutMs > 20_943 && extraction.timeoutMs <= 23_503);
+    assert.ok(verification.timeoutMs >= 20_500 && verification.timeoutMs <= 22_000);
+    assert.ok(verification.timeoutMs <= verification.generationRemainingMs + 1);
+    if (extraMs) assert.ok(verification.timeoutMs >= verification.generationRemainingMs - 1);
+    const admission = h.decisions.filter(event => event.eventType === 'verification_admission')
+      .map(event => event.admission as { effectiveAllowanceMs: number; admitted: boolean });
+    assert.equal(admission.length, 3);
+    assert.ok(admission.every(event => event.admitted && event.effectiveAllowanceMs <= 22_000));
+    assert.ok(admission[2].effectiveAllowanceMs < admission[1].effectiveAllowanceMs, 'reservation consumes the same deadline');
+    const task = (await h.task())!;
+    assert.equal(task.expiresAt - task.acceptedAt, 75_000);
+    assert.equal(task.expiresAt - knowledgeExecutionDeadline(task), 15_000);
+    assert.ok(knowledgeExecutionDeadline(task) - Date.now() >= 1_500);
+    assert.equal(task.modelAttempts, 2);
+    assert.equal(task.result?.independentlyVerified, true);
+    assert.deepEqual(h.owner.events, ['reserve', 'settle', 'reserve', 'settle']);
+    assert.ok(delivery);
+    const sends: string[] = [];
+    assert.equal(await h.run('new-worker'), null);
+    assert.equal((await deliverKnowledge(h.repo, transport(sends), h.scope, h.taskId, delivery.id, 'sender'))?.settled, true);
+    assert.equal(await deliverKnowledge(h.repo, transport(sends), h.scope, h.taskId, delivery.id, 'sender'), null);
+    assert.deepEqual(sends, [FACT]);
+    assert.equal(h.calls.length, 2);
+  });
+
 test('verification exceeding its cap times out once: safe reply, unknown hold kept, no re-dispatch', async t => {
-  const h = await harness(t, { extractionMs: 10_000, verificationMs: 25_000 });
+  const h = await harness(t, { ...observedTiming, verificationMs: 22_500 });
   const delivery = await h.run();
   assert.deepEqual(h.calls.map(c => [c.stage, c.outcome]), [['extraction', 'completed'], ['verification', 'timeout']]);
   assert.equal(delivery?.text, safeText); assert.equal(h.db.rows.deliveries.size, 1);
   const holds = [...h.owner.reservations.values()];
   assert.deepEqual(holds.map(r => [r.quote.stage, !!r.unknown, r.cost !== undefined]), [['extraction', false, true], ['verification', true, false]]);
+  assert.equal(await h.run('new-worker'), null);
+  const sends: string[] = [];
+  assert.ok(delivery);
+  assert.equal((await deliverKnowledge(h.repo, transport(sends), h.scope, h.taskId, delivery.id, 'sender'))?.settled, true);
+  assert.equal(await deliverKnowledge(h.repo, transport(sends), h.scope, h.taskId, delivery.id, 'sender'), null);
+  assert.deepEqual(sends, [safeText]);
+  assert.equal(h.calls.length, 2);
+});
+
+test('insufficient verifier dispatch time after the durable reservation leaves only the extraction charge', async t => {
+  const h = await harness(t, { ...observedTiming, betweenStagesMs: observedTiming.betweenStagesMs + 11_000, verificationReservationMs: 2_500 });
+  assert.equal((await h.run())?.text, safeText);
+  assert.deepEqual(h.calls.map(c => c.stage), ['extraction']);
+  assert.deepEqual(h.owner.events, ['reserve', 'settle']);
+  const admission = h.decisions.filter(event => event.eventType === 'verification_admission');
+  assert.equal(admission.length, 3);
+  assert.equal(admission[2].reason, 'STAGE_ADMISSION');
+  assert.ok(Number((admission[2].admission as any).effectiveAllowanceMs) < ACCURACY_FIRST_POLICY.verificationDispatchMs);
 });
 
 test('extraction slower than the authorized allowance is a timeout (no late capture) and keeps an unknown hold', async t => {
@@ -249,6 +324,14 @@ test('regression: a non-extended durable window keeps the 20 s Sol extraction ca
   assert.deepEqual(h.calls.map(c => [c.stage, c.outcome]), [['extraction', 'timeout']]);
   assert.ok(h.calls[0].timeoutMs <= 20_000, String(h.calls[0].timeoutMs));
   assert.equal(delivery?.text, safeText);
+});
+
+test('regression: a non-extended durable verifier still times out at its original cap', async t => {
+  const h = await harness(t, { windowMs: 40_000, preMs: 1_000, extractionMs: 1_000, verificationMs: 20_500 });
+  assert.equal((await h.run())?.text, safeText);
+  assert.deepEqual(h.calls.map(c => [c.stage, c.outcome]), [['extraction', 'completed'], ['verification', 'timeout']]);
+  assert.ok(h.calls[1].generationRemainingMs > 20_500);
+  assert.ok(h.calls[1].timeoutMs <= 19_999);
 });
 
 test('regression: a non-v2 durable task never selects Sol and gets no durable stage timing', async t => {
