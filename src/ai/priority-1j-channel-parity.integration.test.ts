@@ -82,7 +82,7 @@ function fixture(options: { failOnce?: Failure; adminFailure?: boolean } = {}) {
   };
   const restart = () => { boundary.reset(); boundary.configure(dependencies); };
   restart();
-  return { counters, events, restart };
+  return { counters, events, restart, dependencies };
 }
 
 const businessConfig = { id: '7', businessName: 'Test Clinic', timezone: 'Europe/Stockholm', defaultBookingService: 'Konsultation', calendarProvider: 'custom', googleCalendarId: 'cal-7', allowCancellation: true };
@@ -850,7 +850,7 @@ const messengerAppointment = { id: 'row-ms', calendarEventId: 'event-ms', source
 // Tests 6/7: Messenger cancellation is terminal and duplicate delivery is suppressed.
 {
   const { counters, events } = fixture();
-  events.set('event-ms', { id: 'event-ms', status: 'confirmed', summary: 'Bokad: Peter - 0701234567', description: 'BusinessId: 7', start: { dateTime: new Date(messengerAppointment.start).toISOString() }, end: { dateTime: messengerAppointment.end }, extendedProperties: { private: { businessId: '7', platform: 'messenger', userId: 'ms-owner' } } });
+  events.set('event-ms', { id: 'event-ms', etag: '"ms-v1"', status: 'confirmed', summary: 'Bokad: Peter - 0701234567', description: 'BusinessId: 7', start: { dateTime: new Date(messengerAppointment.start).toISOString() }, end: { dateTime: messengerAppointment.end }, extendedProperties: { private: { businessId: '7', platform: 'messenger', userId: 'ms-owner' } } });
   boundary.seedOwnedAppointment({ sessionId: 'ms_ms-owner', platform: 'messenger', userId: 'ms-owner', businessConfig, appointment: messengerAppointment, operation: 'cancellation' });
   await inbound('ms-reason', 'ms_ms-owner', 'messenger', 'ms-owner', 'Mina planer ändrades', { now: canonicalNow });
   const confirmed = await inbound('ms-confirm', 'ms_ms-owner', 'messenger', 'ms-owner', 'Bale', { now: canonicalNow });
@@ -858,6 +858,7 @@ const messengerAppointment = { id: 'row-ms', calendarEventId: 'event-ms', source
   assert.equal(confirmed.handled, true);
   assert.equal(confirmed.replies.length, 1);
   assert.match(confirmed.replies[0], /cancelled|canceled|avbokad|لغو/u);
+  assert.doesNotMatch(confirmed.replies[0], /nothing was cancelled|not cancelled|avbokades inte/u);
   assert.equal(confirmed.operation.operation, 'none');
   assert.equal(duplicate.replies.length, 0);
   assert.equal(counters.calendarDelete, 1);
@@ -870,12 +871,13 @@ const messengerAppointment = { id: 'row-ms', calendarEventId: 'event-ms', source
 // Messenger admin notification failure cannot replace or suppress customer success.
 {
   const { counters, events } = fixture({ adminFailure: true });
-  events.set('event-ms', { id: 'event-ms', status: 'confirmed', summary: 'Bokad appointment', description: 'BusinessId: 7', start: { dateTime: new Date(messengerAppointment.start).toISOString() }, end: { dateTime: messengerAppointment.end }, extendedProperties: { private: { businessId: '7', platform: 'messenger', userId: 'ms-owner' } } });
+  events.set('event-ms', { id: 'event-ms', etag: '"ms-v1"', status: 'confirmed', summary: 'Bokad appointment', description: 'BusinessId: 7', start: { dateTime: new Date(messengerAppointment.start).toISOString() }, end: { dateTime: messengerAppointment.end }, extendedProperties: { private: { businessId: '7', platform: 'messenger', userId: 'ms-owner' } } });
   boundary.seedOwnedAppointment({ sessionId: 'ms_ms-owner', platform: 'messenger', userId: 'ms-owner', businessConfig, appointment: messengerAppointment, operation: 'cancellation' });
   await turn('ms_ms-owner', 'messenger', 'ms-owner', 'Mina planer ändrades', { now: canonicalNow });
   const confirmed = await turn('ms_ms-owner', 'messenger', 'ms-owner', 'Bale', { now: canonicalNow });
   assert.equal(confirmed.replies.length, 1);
   assert.match(confirmed.replies[0], /cancelled|canceled|avbokad|لغو/u);
+  assert.doesNotMatch(confirmed.replies[0], /nothing was cancelled|not cancelled|avbokades inte/u);
   assert.equal(confirmed.operation.operation, 'none');
   assert.equal(counters.admin, 1);
   assert.equal(counters.calendarDelete, 1);
@@ -886,9 +888,27 @@ console.log('Priority 1J non-Telegram channel-parity real-engine transcripts pas
 
 // Service guidance yields to the authoritative business/service AI layer while
 // retaining only an unresolved booking goal. A selected service resumes booking.
+// OWNER PRODUCT REQUIREMENT (2026-11-27): this behaviour is an AI Brain V2 requirement. It runs under an AUTHORIZED owner Sol decision
+// (scripted classifier: mechanics only). OFF keeps the exact dca2223 baseline, asserted separately in
+// src/ai/understanding/routing/service-guidance-requirement.integration.test.ts. Every assertion below is unchanged.
 {
-  const { counters, events } = fixture();
+  const { counters, events, dependencies } = fixture();
   const sessionId = 'service-guidance-without-selection';
+  const { SemanticRoutingRuntime, readSemanticRoutingConfig } = await import('./understanding/routing/runtime');
+  const ownerDecision = (m: string) => {
+    const continuation = /^En konsultation låter bra/u.test(m);
+    const intent = continuation ? 'booking_continuation' : 'business_information';
+    return { primaryIntent: intent, secondaryIntents: [], confidence: 0.92, requestsMutation: false, asksInformation: !continuation, confirmation: 'none',
+      continuesActiveBooking: continuation, language: 'sv', resolvedQuestion: m, referencesResolved: false, languageSwitch: false,
+      bookingRequest: { serviceMention: continuation ? 'konsultation' : '', affirmative: false }, mixedParts: { informationSpan: '', bookingSpan: '', informationQuestion: '' },
+      evidence: [{ quote: m, intent }] };
+  };
+  boundary.configure({ ...dependencies, semanticRoutingRuntime: new SemanticRoutingRuntime({ config: readSemanticRoutingConfig({
+    ODINLINK_SEMANTIC_ROUTING_MODE: 'owner', ODINLINK_SEMANTIC_ROUTING_BUSINESS_IDS: '7', ODINLINK_SEMANTIC_ROUTING_OWNER_CONVERSATIONS: `7:telegram:${sessionId}` }),
+    classifier: { classify: async (input: any) => ({ output: ownerDecision(input.message) }) } }) } as any);
+  let ownerEvent = 0;
+  const turn = (s: string, channel: 'telegram', recipient: string, text: string) =>
+    boundary.turn({ sessionId: s, platformName: channel, recipientUserId: recipient, text, businessConfig, now: canonicalNow, inboundEvent: { account: 'bot-7', eventId: `sg-${++ownerEvent}` } });
   const first = await turn(
     sessionId,
     'telegram',
@@ -978,8 +998,34 @@ console.log('Priority 1J non-Telegram channel-parity real-engine transcripts pas
 // An explicit informational question temporarily outranks a pending booking CTA
 // without discarding the owned selected slot; readiness resumes normal booking.
 {
-  const { counters, events } = fixture();
+  const { counters, events, dependencies } = fixture();
   const sessionId = 'pending-booking-informational-priority';
+  const { SemanticRoutingRuntime, readSemanticRoutingConfig } = await import('./understanding/routing/runtime');
+  const routingConfig = readSemanticRoutingConfig({
+    ODINLINK_SEMANTIC_ROUTING_MODE: 'owner',
+    ODINLINK_SEMANTIC_ROUTING_BUSINESS_IDS: '7',
+    ODINLINK_SEMANTIC_ROUTING_OWNER_CONVERSATIONS: `7:telegram:${sessionId}`,
+  });
+  boundary.configure({ ...dependencies, semanticRoutingRuntime: new SemanticRoutingRuntime({
+    config: routingConfig,
+    classifier: { classify: async (input) => {
+      const confirming = input.message === 'Ja tack, boka den.';
+      const intent = confirming ? 'confirmation' : 'knowledge_interruption';
+      return { output: {
+        primaryIntent: intent, secondaryIntents: [], confidence: 1,
+        requestsMutation: confirming, asksInformation: !confirming,
+        confirmation: confirming ? 'affirmed' : 'none', continuesActiveBooking: confirming,
+        language: 'sv', resolvedQuestion: input.message, referencesResolved: false, languageSwitch: false,
+        bookingRequest: { serviceMention: '', affirmative: confirming },
+        mixedParts: { informationSpan: '', bookingSpan: '', informationQuestion: '' },
+        evidence: [{ quote: input.message, intent }],
+      } };
+    } },
+  }) });
+  let event = 0;
+  const turn = (session: string, channel: 'telegram', recipient: string, text: string) =>
+    boundary.turn({ sessionId: session, platformName: channel, recipientUserId: recipient, text, businessConfig,
+      now: canonicalNow, inboundEvent: { account: 'bot-7', eventId: `confirmation-info-${++event}` } });
   const start = '2026-08-19T10:00:00+02:00';
   const end = '2026-08-19T08:30:00.000Z';
   boundary.seedPending(sessionId, {

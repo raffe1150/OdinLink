@@ -36,6 +36,24 @@ import { DurableKnowledgeBudget } from './src/p2/durable-knowledge-budget';
 import { knowledgeDatabaseRead, knowledgeOperation } from './src/p2/knowledge-operation';
 import { durableTiming, timeDurableWork } from './src/p2/durable-knowledge-trace';
 import { captureVerified, type KnowledgeTask, type VerifiedKnowledge } from './src/p2/knowledge-lifecycle';
+import { executeReferenceKnowledgeTask, referenceEngineConfig, referenceEngineSelected, type ReferenceExecutorDeps } from './src/p2/reference-knowledge-executor';
+import OpenAIClient from 'openai';
+import { brainV2ProductionWiring } from './src/ai/brain-v2-production-wiring';
+import { configureCanonicalMessageSpend, configureRoutingTurnAllowance, inboundMessageSpendKey, knowledgeMessageRequestKey, knowledgeReferenceMoneyAuthority, knowledgeRoutingMoneyAuthority } from './src/ai/knowledge-model-policy';
+/** AI Brain V2 production bindings (src/ai/brain-v2-production-wiring.ts): every binding defaults OFF and needs its mode flag plus, where a
+ * database change is involved, an explicit attestation. Read once at boot (Render env changes restart the service). */
+const brainV2 = brainV2ProductionWiring(process.env, {
+  // Constructed only by the wiring's managed dispatch (pinned endpoint, trial refused, owner project bound), per request.
+  createClient: options => new OpenAIClient(options) as any,
+  trialEnforced: () => trialEnforced(),
+  routingAuthority: businessId => knowledgeRoutingMoneyAuthority(businessId),
+  referenceOwner: businessId => knowledgeReferenceMoneyAuthority(businessId),
+});
+// Set the routing request cap and canonical spend identity before installing the durable owner.
+configureRoutingTurnAllowance(brainV2.routingAllowanceNanoUsd);
+configureCanonicalMessageSpend(brainV2.canonicalSpendTenant);
+console.info('[BrainV2Wiring]', JSON.stringify(brainV2.status));
+const referenceKnowledgeBinding: Pick<ReferenceExecutorDeps, 'owner' | 'transport' | 'remainingMs'> | undefined = brainV2.referenceBinding;
 import type { KnowledgeExecutor } from './src/p2/knowledge-runner';
 import { prepareLiteralTurn, type SharedTurnExecutionResult, hasConversationReference, hasExternalConversationReference, continuesReferenceClarification, referenceClarificationReply, mixedActionClarificationReply } from './src/ai/conversation-intent-continuity';
 import { wholeQuestionInformationPlan, documentKnowledgeTopicsEligible, deterministicLocationPlan, literalInformationFallback, literalInformationPlan, knowledgeProposalAllowance, KNOWLEDGE_PLANNING_LIMIT_MS, KNOWLEDGE_VERIFICATION_MIN_MS } from './src/ai/knowledge-planning';
@@ -212,6 +230,8 @@ import { understandBookingTurn } from "./src/ai/understanding/understand-booking
 import type { UnderstandingProviderInput } from "./src/ai/understanding/provider";
 import { createConfiguredUnderstandingShadowRuntime } from "./src/ai/understanding/shadow";
 import { createConfiguredUnderstandingProvider } from "./src/ai/understanding/config";
+import { SemanticRoutingRuntime, readSemanticRoutingConfig, boundedRoutingHistory, type RoutingConversation } from "./src/ai/understanding/routing/runtime";
+import type { RouteDecision } from "./src/ai/understanding/routing/policy";
 import {
   resolveLanguageBrain,
   type SemanticLanguageDecision,
@@ -1684,6 +1704,7 @@ type Priority1hTestDependencies = {
   testExecutionProvenanceStore?: TestExecutionResourceProvenanceStore | null;
   testBridgeNow?: () => number;
   structuredUnderstandingAdoptionRuntime?: UnderstandingAdoptionRuntime | null;
+  semanticRoutingRuntime?: SemanticRoutingRuntime | null;
   bookingLanguageTrace?: (event: {
     stage: string;
     sessionId: string;
@@ -5501,7 +5522,8 @@ type BusinessInformationTurn = {
 const businessInformationTurns: Record<string, BusinessInformationTurn> = {};
 // Opt-in shared rollout. No per-channel overrides; no persistent answer/unit cache.
 type NativeKnowledgeEvent = {eventId:string;account:string;recipient:string;order:NativeKnowledgeOrder|null};
-type KnowledgeTurnState = { readonly modelProfile?: KnowledgeModelProfile; readonly extractionProtocol?: KnowledgeExtractionProtocol; readonly verificationProtocol?: KnowledgeVerificationProtocol; nativeEvent?: NativeKnowledgeEvent; nativeAsync?: {runtime:NativeKnowledgeRuntime|null;admission:NativeKnowledgeAdmission|null;failed:boolean}; durableCheckpoint?: (stage: 'extraction') => Promise<void>; durableProgress?: Parameters<KnowledgeExecutor>[1]['progress']; durableCurrent?: () => Promise<boolean>; mixedRequest?: boolean; requiresReferenceResolution?: boolean; unresolvedReference?: boolean; referenceClarificationText?: string; migrated?: boolean; budget?: InformationBudget; facets?: Facet[]; oversized?: boolean; evidence?: Evidence[];
+type KnowledgeTurnState = { /** Authenticated inbound event of a durable task (canonical per-message spend identity). */
+  spendIdentity?: { channel: string; account: string; eventId: string }; readonly modelProfile?: KnowledgeModelProfile; readonly extractionProtocol?: KnowledgeExtractionProtocol; readonly verificationProtocol?: KnowledgeVerificationProtocol; nativeEvent?: NativeKnowledgeEvent; nativeAsync?: {runtime:NativeKnowledgeRuntime|null;admission:NativeKnowledgeAdmission|null;failed:boolean}; durableCheckpoint?: (stage: 'extraction') => Promise<void>; durableProgress?: Parameters<KnowledgeExecutor>[1]['progress']; durableCurrent?: () => Promise<boolean>; mixedRequest?: boolean; requiresReferenceResolution?: boolean; unresolvedReference?: boolean; referenceClarificationText?: string; migrated?: boolean; budget?: InformationBudget; facets?: Facet[]; oversized?: boolean; evidence?: Evidence[];
   ownsDurableLease?: () => Promise<boolean>;
   repairedDurableOversizedEmpty?: boolean;
   ownerAnswerSelection?: OwnerAnswerSelection;
@@ -5576,7 +5598,11 @@ function runUnifiedConversationRequest<T>(work: () => Promise<T>, nativeChannel:
     verifiedMetaTenantId !== null ? verifiedTenantRequestScope.getStore() : null;
   const timingConfig = verifiedMetaState?.businessConfig || written?.config;
 
+  const start = () => {
+  // A semantic mixed turn is never a timed knowledge turn: the timed scope permits one secured knowledge delivery only, so the
+  // Booking Engine's reply could not be delivered (and acknowledged) on its own. It takes the untimed path, like OFF mixed turns.
   const scoped = accuracyFirstEnabled(Number(timingBusinessId)) && !!written?.text &&
+    semanticRouteScope.getStore()?.decision?.lane !== 'mixed' &&
     verifiedKnowledgeInformationRequest(written.text, timingConfig,nativeChannel);
   return withBusinessInformationTiming(() => requestSecurity.run(() => knowledgeTurnScope.run({nativeChannel,nativeEvent,naturalEnabled,...(naturalBypassed?{naturalBypassed:true}:{}),...(naturalEnabled?{
     naturalSinglePartial:process.env.ODINLINK_GROUNDED_NATURAL_SINGLE_PARTIAL==='true',naturalTurnId:crypto.randomUUID()}: {})}, () => scoped
@@ -5586,6 +5612,47 @@ function runUnifiedConversationRequest<T>(work: () => Promise<T>, nativeChannel:
           const language=knowledgeTurnScope.getStore()?.replyLanguage || (requestSecurity.evidence?.support ? capturedSupportLanguage(requestSecurity.evidence.support) : written.config.language || 'en');
           await sendCustomerMessage(nativeChannel,nativeEvent.recipient,knowledgeUnavailableReply(language),timingConfig,'conversation');
         }, event => runOptionalDiagnostic(() => console.info('[KnowledgeTimingPolicy]', event)), Number(timingBusinessId)) : work())), nativeChannel);
+  };
+  // Semantic routing (default OFF): OFF keeps the exact synchronous path above with no extra work.
+  if (semanticRoutingRuntime().mode === 'off' || !written?.text || !nativeEvent || !nativeChannel || !Number.isSafeInteger(Number(timingBusinessId))) return start();
+  return nativeSemanticRoute(nativeChannel, nativeEvent, written.text, timingConfig, Number(timingBusinessId))
+    .then(route => route ? semanticRouteScope.run({ ...route, native: true }, start) : start(), () => start());
+}
+/** Conversation context for semantic understanding: the session's own (tenant/channel/customer-scoped) published history, the
+ * authoritative booking state and the stored conversation language. Passed to the model as untrusted data, never as instructions. */
+function semanticRoutingConversation(sessionId: string, pending: any, history: unknown): RoutingConversation {
+  const phase = pending ? getBookingPhase(pending) : null;
+  const known = pending ? (['service', 'date', 'time', 'name', 'phone'] as const).filter(field =>
+    field === 'service' ? !!pending.service : field === 'date' ? !!(pending.selectedDate || pending.dateTime) : field === 'time' ? !!pending.dateTime :
+    field === 'name' ? !!pending.customerName : !!pending.customerPhone) : [];
+  const clarification = getActiveBusinessInformation(sessionId)?.referenceClarification ? getActiveBusinessInformation(sessionId)?.question : null;
+  return { history: boundedRoutingHistory(Array.isArray(history) ? history : []),
+    booking: phase && !['idle', 'completed'].includes(phase) ? { phase, operation: pending?.operation ? String(pending.operation) : null, knownFields: known,
+      awaitingConfirmation: phase === 'awaiting_slot_confirmation' } : null,
+    conversationLanguage: getStoredFlowLanguage(sessionId), pendingClarification: clarification ? String(clarification).slice(0, 600) : null };
+}
+/** One classification per native turn, before accuracy-first timing; the executor reuses it. Booking state is read with the
+ * same owner checks the handler uses; if it cannot be read the turn keeps legacy routing (no classification). */
+async function nativeSemanticRoute(channel: 'telegram'|'whatsapp'|'messenger'|'instagram', event: NativeKnowledgeEvent, text: string, config: any,
+  businessId: number): Promise<SemanticRouteState | null> {
+  const routing = semanticRoutingRuntime();
+  const routedText = normalizeConversationText(text);
+  if (!routedText || !routing.eligible({ businessId, channel, conversationId: String(event.recipient || '') })) return null;
+  const sessionId = channel === 'telegram'
+    ? `tg:${businessId}:${telegramTokenFingerprint(String(config?.telegramToken || ''))}:${event.recipient}`
+    : getScopedChannelSessionId(channel, event.recipient, config, event.account);
+  let pending: any;
+  try { pending = await loadPendingBooking(sessionId, channel, config, { throwOnReadFailure: true }); } catch { return null; }
+  const phase = pending ? getBookingPhase(pending) : null;
+  const active = phase && !['idle', 'completed'].includes(phase) ? { phase, awaitingConfirmation: phase === 'awaiting_slot_confirmation' } : null;
+  const spendKey = (() => { try { return inboundMessageSpendKey({ businessId, channel, account: String(event.account || ''), eventId: String(event.eventId || '') }); }
+    catch { return undefined; } })();
+  const routed = await routing.route({ businessId, channel, conversationId: String(event.recipient), turnKey: `native:${event.eventId}`, ...(spendKey ? { spendKey } : {}),
+    message: routedText, context: { activeBooking: active }, conversation: semanticRoutingConversation(sessionId, pending, chatSessions[sessionId]),
+    legacy: { knowledgeAdmitted: verifiedKnowledgeInformationRequest(routedText, config, channel), explicitAction: isExplicitBusinessActionRequest(routedText) } })
+    .catch(() => null);
+  if (!routed || routed.outcome === 'skipped') return null;
+  return { text: routedText, decision: routed.applied };
 }
 
 const nativeIntakeScope = new AsyncLocalStorage<{runtime:NativeKnowledgeRuntime;admission:NativeKnowledgeAdmission;handoffAttempted?:boolean}>();
@@ -5600,6 +5667,16 @@ function getNativeKnowledgeRuntime():NativeKnowledgeRuntime|null {
     execute:async(task,context,current)=>{
       const {data,error}=await knowledgeDatabaseRead(supabase!.from('businesses').select('*').eq('id',task.scope.businessId).maybeSingle());
       if(error || !data || Number(data.id)!==task.scope.businessId) throw new Error('knowledge_business_scope_unavailable');
+      // Reference Knowledge Engine: default OFF (src/p2/reference-knowledge-executor.ts). Inert until a money owner accessor and a
+      // provider transport are separately approved and installed; any pre-execution refusal keeps the existing engine.
+      if(referenceEngineSelected(task,referenceEngineConfig()) && referenceKnowledgeBinding){
+        const tenantConfig=normalizeBusinessConfig(data);
+        const reference=await executeReferenceKnowledgeTask(task,context,current,{...referenceKnowledgeBinding,
+          listSources:businessId=>knowledgeService.list(businessId),
+          configuredPolicyAuthority:t=>configuredPolicyQuestion(t.input.question,tenantConfig)||configuredPolicyQuestion(t.input.interpretation||'',tenantConfig),
+          diagnostic:event=>runOptionalDiagnostic(()=>console.info('[ReferenceKnowledge]',JSON.stringify(event)))});
+        if(reference.admitted) return reference.result;
+      }
       return executeDurableKnowledgeTask(task,context,normalizeBusinessConfig(data),current);
     }});
   return hostedNativeKnowledge;
@@ -5704,7 +5781,75 @@ function directConfiguredServicePlan(question:string,businessConfig:any,referenc
 function directConfiguredMixedPlan(question:string,businessConfig:any,referenceRequired=false) {
   return directMixedSourceInformationPlan(question,Number(getBusinessIdFromConfig(businessConfig)),businessConfig?.services,referenceRequired);
 }
+// Semantic routing (default OFF). Applies only to the exact turn text it classified.
+type SemanticRouteState = { text: string; decision: RouteDecision | null; native?: boolean;
+  /** Clause-level semantic overrides for a semantically split mixed turn (information span -> admit; booking span -> deny). */
+  clauses?: Map<string, 'admit' | 'deny'>;
+  /** Set only while the Booking Engine processes a semantic FRAGMENT (the booking span of a split mixed turn). A fragment is a routing
+   * aid, never mutation or consent authority: every mutation point refuses while it is set (fragmentMutationForbidden). */
+  fragmentClause?: boolean };
+const semanticRouteScope = new AsyncLocalStorage<SemanticRouteState>();
+/** Test boundary only (NODE_ENV=test): the authenticated inbound event of a directly driven foreground turn. */
+const testInboundEventScope = new AsyncLocalStorage<{ account: string; eventId: string }>();
+/** Defence in depth for mixed turns: no calendar or database mutation may be authorized by a semantic fragment. The split itself is only
+ * applied when no booking, reschedule or cancellation state exists, so a fragment can only start a booking (availability/service step). */
+function fragmentMutationForbidden(): boolean {
+  return semanticRouteScope.getStore()?.fragmentClause === true;
+}
+// No accounted classifier is installed (the 'routing' money stage is prepared but NOT applied), so
+// SHADOW/OWNER never dispatch in production (outcome not_accounted -> legacy).
+const hostedSemanticRouting = new SemanticRoutingRuntime({ config: readSemanticRoutingConfig(process.env), classifier: brainV2.routingClassifier,
+  observe: o => runOptionalDiagnostic(() => console.info('[SemanticRouting]', JSON.stringify(o))) });
+function semanticRoutingRuntime(): SemanticRoutingRuntime {
+  return priority1hTestDependencies?.semanticRoutingRuntime || hostedSemanticRouting;
+}
+function semanticKnowledgeOverride(question:string): 'admit'|'deny'|null {
+  const route = semanticRouteScope.getStore();
+  if (!route?.decision) return null;
+  const text = normalizeConversationText(question);
+  if (route.text === text) return route.decision.knowledge;
+  return route.clauses?.get(text) ?? null;
+}
+/** True only when an authorized, applied Brain V2 decision covers exactly this text (the classified turn, or one of its semantic parts).
+ * Owner-mode refinements are gated on it so that OFF (and any turn without an applied decision) keeps the baseline behaviour exactly. */
+function semanticDecisionApplies(question: string): boolean {
+  const route = semanticRouteScope.getStore();
+  if (!route?.decision) return false;
+  const text = normalizeConversationText(question);
+  return route.text === text || route.clauses?.has(text) === true;
+}
+/** The information clause of a semantically split mixed turn (owner). Its booking clause ran first in the same turn. */
+function semanticInformationClause(question: string): boolean {
+  const route = semanticRouteScope.getStore(), d = route?.decision;
+  return !!(d?.lane === 'mixed' && d.parts && route!.clauses && normalizeConversationText(d.parts.informationSpan) === normalizeConversationText(question));
+}
+/** Sol's standalone restatement for exactly this information text (whole knowledge turn, or the information span of a semantic mixed
+ * split), only when it differs from the customer's words; bounded to the durable input limit. Undefined otherwise. */
+function semanticInterpretation(question: string): string | undefined {
+  const route = semanticRouteScope.getStore(), d = route?.decision;
+  if (!d) return undefined;
+  const text = normalizeConversationText(question);
+  const candidate = d.lane === 'mixed' && d.parts && normalizeConversationText(d.parts.informationSpan) === text ? d.parts.informationQuestion
+    : d.lane === 'knowledge' && route!.text === text ? d.interpretation : undefined;
+  const value = candidate?.trim();
+  return value && value !== text && value.length <= 600 ? value : undefined;
+}
+/** Sol's structured booking intent for exactly this booking text (the whole turn on the booking lane, or the booking span of a semantic
+ * mixed split). Null otherwise: existing deterministic understanding applies unchanged. Never authority over state, availability or
+ * confirmation: it only replaces lexical intent/service extraction for the text Sol classified. */
+function semanticBookingRequest(question: string): { intent: string; serviceMention: string | null } | null {
+  const route = semanticRouteScope.getStore(), d = route?.decision;
+  // Affirmative initial booking requests only: continuation, confirmation, reschedule, cancellation and negated/conditional wording keep
+  // the authoritative booking state machine on the customer's full words.
+  if (!d?.booking || !d.booking.affirmative || !['new_booking', 'availability'].includes(d.booking.intent)) return null;
+  const text = normalizeConversationText(question);
+  if (d.lane === 'booking' && route!.text === text) return d.booking;
+  if (d.lane === 'mixed' && d.parts && normalizeConversationText(d.parts.bookingSpan) === text) return d.booking;
+  return null;
+}
 function isCurrentBusinessInformationRequest(question:string,businessConfig:any) {
+  const semantic = semanticKnowledgeOverride(question);
+  if (semantic) return semantic === 'admit';
   // Confirmation/status is an appointment operation, not documentary policy.
   // Reuse the same exclusion before native timing and actual Knowledge intake.
   if (isRecentCompletedBookingStatusQuestion(question)) return false;
@@ -5728,8 +5873,33 @@ function evidenceFirstEligible(question: string, businessConfig?:any,nativeChann
     (!cancellationInformationRequested(question) || isArrivalInformationQuestion(question) || cancellationPolicy) &&
     (documentKnowledgeTopicsEligible(question) || isMixedSourceInformationQuestion(question,businessConfig) || Boolean(directConfiguredServicePlan(question,businessConfig))) && !isServiceCatalogQuestion(question);
 }
+/** Evidence-first eligibility for the durable/native Knowledge hand-off. An authorized, applied semantic information decision for exactly
+ * this text replaces only the lexical topic gate (a resolved short follow-up such as "And who should I tell?" carries no topic words);
+ * the evidence-first feature gate and the configured-catalog exclusion stay authoritative. No applied decision → baseline predicate. */
+function semanticEvidenceFirstEligible(question: string, businessConfig?: any): boolean {
+  const semantic = semanticKnowledgeOverride(question);
+  if (semantic === 'deny') return false;   // an applied semantic deny (booking / clarify / general) never reaches Knowledge
+  if (semantic === 'admit')
+    return process.env.ODINLINK_EVIDENCE_FIRST_KNOWLEDGE === 'true' && !isServiceCatalogQuestion(question);
+  return evidenceFirstEligible(question, businessConfig);
+}
+/** Configured business policy domains whose authority is the tenant's CONFIGURATION, not uploaded documents: cancellation policy,
+ * the configured service catalog (services, durations, prices) and opening hours. The Reference Engine (Knowledge Library only) never
+ * answers these: they stay on the existing engine, which binds the configured policy as authoritative evidence, so an uploaded
+ * document can never override a current configured policy. Deterministic predicates are used only to EXCLUDE (fail-safe direction). */
+function configuredPolicyQuestion(question: string, businessConfig: any): boolean {
+  const q = String(question || '');
+  if (!q.trim()) return false;
+  return hasCancellationInformationTopic(q) || cancellationInformationRequested(q) || isServiceCatalogQuestion(q, true) || isServiceDurationQuestion(q) ||
+    Boolean(directConfiguredServicePlan(q, businessConfig) || directConfiguredMixedPlan(q, businessConfig)) ||
+    businessInformationTopics(q).some(topic => topic === 'hours' || topic === 'prices');
+}
 /** One read-only admission contract for native timing and Knowledge budgeting. */
 function verifiedKnowledgeInformationRequest(question:string,businessConfig:any,nativeChannel=knowledgeTurnScope.getStore()?.nativeChannel):boolean {
+  const semantic = semanticKnowledgeOverride(question);
+  // A validated semantic route replaces only the lexical topic/action gates; the
+  // evidence-first feature gate and the configured-catalog path remain authoritative.
+  if (semantic) return semantic === 'admit' && process.env.ODINLINK_EVIDENCE_FIRST_KNOWLEDGE === 'true' && !isServiceCatalogQuestion(question);
   return !isExplicitBusinessActionRequest(question) && !isExistingAppointmentLookupIntent(question) &&
     isCurrentBusinessInformationRequest(question,businessConfig) &&
     evidenceFirstEligible(question,businessConfig,nativeChannel);
@@ -6066,11 +6236,16 @@ async function generateNativeKnowledgeContent(sessionId:string,options:any,suppo
     const configuredExtractionProtocol = state.extractionProtocol ?? selectKnowledgeExtractionProtocol();
     const durableBudget = state.budget instanceof DurableKnowledgeBudget ? state.budget : undefined;
     const durablePublication = durableBudget?.publicationV2 === true;
+    // While routing is accounted, every paid phase of the inbound message shares its canonical spend identity (one database bucket under
+    // the effective plan-aware ceiling). Without an authenticated native event, or with routing not accounted, the baseline keys apply.
+    const spend = state.spendIdentity ?? (state.nativeChannel && state.nativeEvent?.eventId && state.nativeEvent.account
+      ? { channel: state.nativeChannel, account: state.nativeEvent.account, eventId: state.nativeEvent.eventId } : null);
     const modelBinding = controlledTrialBinding() ?? Object.freeze({ businessId: state.businessId,
       turnId: durablePublication ? state.naturalTurnId! : nativeKnowledgeTiming()?.turnId ?? '',
-      requestKey: crypto.createHash('sha256').update(JSON.stringify(durablePublication
+      requestKey: knowledgeMessageRequestKey({ businessId: Number(state.businessId), spend,
+        baselineKey: crypto.createHash('sha256').update(JSON.stringify(durablePublication
         ? ['native-durable-knowledge', state.businessId, state.naturalTurnId]
-        : [sessionId, state.nativeEvent?.eventId ?? null, support.question])).digest('hex') });
+        : [sessionId, state.nativeEvent?.eventId ?? null, support.question])).digest('hex') }) });
     const modelEvidenceSnapshot = state.snapshot?.evidence ?? [];
     if (state.modelProfile === undefined) Object.defineProperty(state, 'modelProfile', { enumerable: true, value: captureKnowledgeModelProfile({
       ...modelBinding, durablePublicationV2: durablePublication, provider: getConfiguredAiProvider(), nativeForeground: !!nativeKnowledgeTiming() && !!state.nativeChannel && !!state.nativeEvent?.eventId,
@@ -6303,6 +6478,7 @@ export async function executeDurableKnowledgeTask(task: KnowledgeTask,
   const naturalBypassed = naturalRequested && !groundedNaturalProtocolCompatible();
   const naturalEnabled = naturalRequested && !naturalBypassed;
   const state: KnowledgeTurnState = { nativeChannel: task.scope.channel, sessionId, ...(naturalBypassed ? { naturalBypassed: true } : {}),
+    spendIdentity: { channel: task.scope.channel, account: task.scope.providerAccount, eventId: task.eventId },
     budget, businessId: task.scope.businessId, question: question, history: structuredClone([...task.input.history]),
     durableCheckpoint: context.checkpoint, durableProgress: context.progress, ownsDurableLease: context.ownsLease,
     durableCurrent: async () => !context.signal.aborted && budget.remaining() > 0 && await current() &&
@@ -6831,12 +7007,15 @@ function shouldDispatchWhatsAppUnifiedBooking(chatId: string, text: string, inte
   if (intent === "language_repair") return false;
   if (getRecentCompletedBooking(chatId)?.bookingOperation?.ok) return true;
   if (isCurrentBusinessInformationRequest(text,businessConfig)) return true;
+  // An applied owner decision that asks for clarification hands the turn to the unified engine, as on every other channel (otherwise the
+  // semantic deny would remove the lexical information signal and make WhatsApp alone treat the turn as clearly non-booking).
+  if (semanticDecisionApplies(text) && semanticRouteScope.getStore()?.decision?.lane === 'clarify') return true;
   if (intent === "ambiguous") return isDeterministicActiveNewBookingContinuation(chatId, text);
   const clearlyNonBooking = intent === "normal" &&
     !pendingBookings[chatId] && !hasAppointmentConversationState(chatId) &&
     !extractNameAndPhone(text) && !extractPhoneOnly(text) && !extractNameOnly(text) &&
     !isNewBookingRequestText(text) && !isExplicitNewBookingPivotText(text) &&
-    !extractConcreteRequestedService(text) &&
+    !extractConcreteRequestedService(text) && !semanticBookingRequest(text) &&
     !isExistingAppointmentLookupIntent(text) && !isRescheduleIntent(text) &&
     !isCancellationIntent(text) && !resolveExplicitBookingDate(text) &&
     !inferRequestedTimeFromText(text);
@@ -13088,7 +13267,10 @@ function resolveAuthoritativeBookingService(
   const terseMatches = eligible.some(service => [service.name, ...service.aliases].some(label =>
     serviceIntentMatchScore(terseEvidence, label) >= SERVICE_AUTO_MATCH_CONFIDENCE
   ));
-  const evidence = semanticRefinesConcrete ? semanticPhrase! : concrete || semanticPhrase || (terseMatches ? terseEvidence : null) || (inferServiceFromText(text) !== "Bokning" ? text : null);
+  // With Sol's structured booking intent for this text, only its service words (or none) are service evidence.
+  const semanticBooking = semanticBookingRequest(text);
+  const evidence = semanticBooking ? semanticBooking.serviceMention
+    : semanticRefinesConcrete ? semanticPhrase! : concrete || semanticPhrase || (terseMatches ? terseEvidence : null) || (inferServiceFromText(text) !== "Bokning" ? text : null);
   if (evidence) {
     const scored = eligible.map(service => ({
       service,
@@ -13186,6 +13368,9 @@ function extractAwaitingServiceLabel(text: string): string | null {
 }
 
 function extractConcreteRequestedService(text?: string): string | null {
+  // Sol named the service (verbatim, decoder-validated) or named none: no lexical guess (e.g. "book me in" -> "me").
+  const semantic = semanticBookingRequest(String(text || ""));
+  if (semantic) return semantic.serviceMention;
   const currentIntent = detectNormalizedIntent(String(text || ""));
   if (["cancellation", "reschedule", "booking_lookup"].includes(currentIntent)) return null;
   if (isBookingResumeRequest(String(text || ""))) return null;
@@ -13565,6 +13750,7 @@ async function renderMissingServiceBookingReply(
   language: string,
   configuredServices: string[],
   toneConfig?: unknown,
+  guidanceServices?: any[],
 ): Promise<string> {
   const input: ServiceClarificationPresentationInput = {
     status: "missing",
@@ -13575,7 +13761,11 @@ async function renderMissingServiceBookingReply(
     toneConfig,
   };
 
-  return getDeterministicServiceClarificationFallback(input);
+  const catalog = guidanceServices
+    ? formatConfiguredServiceCatalogPlan(buildConfiguredServiceCatalogPlan(guidanceServices), language)
+    : "";
+  const prompt = getDeterministicServiceClarificationFallback(input);
+  return catalog ? `${catalog}\n\n${prompt}` : prompt;
 }
 
 function fallbackConfiguredServiceDatePrompt(language: string, service: string, requestedTime?: string): string {
@@ -18793,9 +18983,47 @@ function getPendingNormalizedBookingRequest(
 /** Execute the already-split literal branches under the existing serialized
  * owner. The Booking Engine itself continues to enforce all domain authority. */
 async function executePreparedLiteralTurn(params: UnifiedBookingEngineParams): Promise<SharedTurnExecutionResult> {
-  const preparation = prepareLiteralTurn(normalizeConversationText(params.text), clause =>
-    isExplicitBusinessActionRequest(clause) ||
-    (!isBusinessInformationQuestion(clause) && (isRescheduleIntent(clause) || isCancellationIntent(clause))));
+  const routing = semanticRoutingRuntime();
+  const routedText = normalizeConversationText(params.text);
+  if (routing.mode === 'off' || !routedText || semanticRouteScope.getStore()?.text === routedText) return executeLiteralTurn(params);
+  const pending = pendingBookings[params.sessionId] || null;
+  const phase = pending ? getBookingPhase(pending) : null;
+  const active = phase && !['idle', 'completed'].includes(phase) ? { phase, awaitingConfirmation: phase === 'awaiting_slot_confirmation' } : null;
+  // Paid classification needs the authenticated inbound event of this turn (canonical per-message spend identity). Without one (non-native
+  // callers) the runtime refuses before any hold and the turn keeps legacy routing.
+  const inbound = knowledgeTurnScope.getStore()?.nativeEvent ?? (process.env.NODE_ENV === 'test' ? testInboundEventScope.getStore() : undefined);
+  const businessIdForSpend = Number(getBusinessIdFromConfig(params.businessConfig));
+  const spendKey = inbound ? (() => { try { return inboundMessageSpendKey({ businessId: businessIdForSpend, channel: params.platformName,
+    account: inbound.account, eventId: inbound.eventId }); } catch { return undefined; } })() : undefined;
+  const routed = await routing.route({ businessId: Number(getBusinessIdFromConfig(params.businessConfig)), channel: params.platformName, ...(spendKey ? { spendKey } : {}),
+    conversationId: String(params.recipientUserId || ''), turnKey: `${params.customerMessageAt || ''}|${crypto.createHash('sha256').update(routedText).digest('hex')}`,
+    message: routedText, context: { activeBooking: active }, conversation: semanticRoutingConversation(params.sessionId, pending, params.history),
+    legacy: { knowledgeAdmitted: verifiedKnowledgeInformationRequest(routedText, params.businessConfig), explicitAction: isExplicitBusinessActionRequest(routedText) } })
+    .catch(() => null);
+  return semanticRouteScope.run({ text: routedText, decision: routed?.applied ?? null }, () => executeLiteralTurn(params));
+}
+
+async function executeLiteralTurn(params: UnifiedBookingEngineParams): Promise<SharedTurnExecutionResult> {
+  const text = normalizeConversationText(params.text);
+  const scope = semanticRouteScope.getStore();
+  const routeState = scope?.text === text ? scope : undefined;
+  const semanticParts = routeState?.decision?.lane === 'mixed' ? routeState.decision.parts : null;
+  // A booking fragment can request preliminary guidance only on a fresh booking. When an appointment flow already exists,
+  // answer the information clause without processing either a semantic or a legacy booking fragment as consent.
+  const deferMixedBooking = Boolean(semanticParts && (pendingBookings[params.sessionId] ||
+    hasAppointmentConversationState(params.sessionId) || getRecentCompletedBooking(params.sessionId)));
+  if (semanticParts && routeState) {
+    routeState.clauses = new Map([[normalizeConversationText(semanticParts.informationSpan), 'admit']]);
+    if (!deferMixedBooking) routeState.clauses.set(normalizeConversationText(semanticParts.bookingSpan), 'deny');
+  }
+  const preparation = semanticParts
+    ? deferMixedBooking
+      ? { kind: 'single' as const, clauses: [{ kind: 'information' as const, text: semanticParts.informationSpan }], executionOrder: [0] }
+      : { kind: 'mixed' as const, clauses: [{ kind: 'information' as const, text: semanticParts.informationSpan }, { kind: 'action' as const, text: semanticParts.bookingSpan }],
+          executionOrder: [1, 0] }
+    : prepareLiteralTurn(text, clause =>
+      isExplicitBusinessActionRequest(clause) ||
+      (!isBusinessInformationQuestion(clause) && (isRescheduleIntent(clause) || isCancellationIntent(clause))));
   const knowledgeState=knowledgeTurnScope.getStore();
   if(knowledgeState && preparation.kind==='mixed')knowledgeState.mixedRequest=true;
   let history = preparation.kind === 'mixed' ? immutable(params.history || []) : params.history;
@@ -18808,7 +19036,12 @@ async function executePreparedLiteralTurn(params: UnifiedBookingEngineParams): P
   let handled = false;
   for (const index of preparation.executionOrder) {
     const clause = preparation.clauses[index];
-    handled = await handleUnifiedBookingEngineTurn({ ...params, text: clause.text, history });
+    // Booking replies always go out through the channel's acknowledged send (no buffering): a confirmation or offer is recorded as
+    // delivered only on the provider's acknowledgement. The knowledge reply follows as its own message.
+    const fragment = Boolean(semanticParts && routeState);
+    if (fragment) routeState!.fragmentClause = true;
+    try { handled = await handleUnifiedBookingEngineTurn({ ...params, text: clause.text, history }); }
+    finally { if (fragment) routeState!.fragmentClause = false; }
     if (preparation.kind === 'mixed' && clause.kind === 'action' && !handled) {
       const reply = mixedActionClarificationReply(getConversationLanguage(params.sessionId, clause.text, params.businessConfig));
       if (await params.send(reply) === false) return { kind: 'handled', preparation };
@@ -19016,6 +19249,9 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
   const bookingInterrupted = hasBookingInterruption(text) &&
     !isExplicitBusinessActionRequest(withoutNegatedBookingClauses(text));
   const currentInformationQuestion = clarifiesReference || isCurrentBusinessInformationRequest(text,businessConfig);
+  const guidanceServices = semanticBookingRequest(text)?.intent === "new_booking" && isBookingGoalWithUnresolvedService(text)
+    ? businessConfig?.services
+    : undefined;
   const pausePendingContinuation = async () => {
     if (pending && getBookingPhase(pending) !== "finalizing" && !pending.continuationPaused) {
       pending.continuationPaused = true;
@@ -19042,9 +19278,11 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
     }
     return true;
   };
-  const noReferenceContext = !(history || []).some(m => m.role === "assistant" && typeof m.content === "string" && m.content.trim());
+  // An active booking is itself conversational reference context (the selected service/slot the customer is talking about).
+  const noReferenceContext = !(history || []).some(m => m.role === "assistant" && typeof m.content === "string" && m.content.trim()) &&
+    !(semanticDecisionApplies(text) && pending && !["idle", "completed"].includes(getBookingPhase(pending)));
   if (currentInformationQuestion && hasExternalConversationReference(text) &&
-      ((noReferenceContext && !businessInformationTopics(text).length) ||
+      ((noReferenceContext && !businessInformationTopics(text).length && semanticKnowledgeOverride(text) !== 'admit') ||
         (clarification && normalizeConversationText(text) === normalizeConversationText(clarification.question)))) {
     return clarifyInformationReference();
   }
@@ -19111,7 +19349,19 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
     !explicitAvailabilityRequest &&
     !isExistingAppointmentLookupIntent(text) &&
     getBookingPhase(pending) !== "finalizing") {
-    await pausePendingContinuation();
+    // This branch pre-empts the later service-guidance branch. A NEW booking goal whose service is unresolved (the same existing
+    // predicate that branch uses) must still be retained as awaiting_service while the information answer is prepared.
+    // Owner decision only (OFF keeps the baseline: no awaiting_service is created here).
+    // Product requirement (owner-approved 2026-11-27): a customer who wants to book but does not know which service fits is helped to
+    // choose while the booking goal stays retained as awaiting_service, and the next short reply (the chosen service) continues it.
+    const retainedServiceGoal = semanticDecisionApplies(text) && !pending && isBookingGoalWithUnresolvedService(text) && !isResolvedServiceSelection(text);
+    if (retainedServiceGoal) {
+      await suspendServiceChoice(getConversationLanguage(sessionId, text, businessConfig));
+    }
+    // The information part of a semantic mixed turn must not pause the booking its own booking part just started, and a booking goal
+    // retained by THIS turn must not be paused by it (the customer's next short reply continues either). Every other information turn
+    // keeps the baseline pause.
+    if (!semanticInformationClause(text) && !retainedServiceGoal) await pausePendingContinuation();
     const recentCompletion = getRecentCompletedBooking(sessionId);
     const currentLanguage = getConversationLanguage(sessionId, text, businessConfig);
     const informationLanguage = recentCompletion?.bookingOperation?.ok
@@ -19129,19 +19379,20 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
     markBusinessInformationTiming(sessionId, 'retrieval_start');
     const configuredOnly = Boolean(catalog && configuredAddress);
     const knowledgeState = knowledgeTurnScope.getStore();
-    if (knowledgeState && evidenceFirstEligible(informationQuestion,businessConfig)) knowledgeState.sessionId=sessionId;
+    if (knowledgeState && semanticEvidenceFirstEligible(informationQuestion,businessConfig)) knowledgeState.sessionId=sessionId;
     if (knowledgeState) knowledgeState.requiresReferenceResolution = clarifiesReference;
     if (knowledgeState) knowledgeState.history = (history || []).filter(m => typeof m.content === 'string').slice(-4).map(m => ({ role: m.role, content: m.content.slice(0, 1200) }));
     const nativeAsync=knowledgeState?.nativeAsync;
-    if (nativeAsync && evidenceFirstEligible(informationQuestion,businessConfig) && !configuredOnly) {
+    if (nativeAsync && semanticEvidenceFirstEligible(informationQuestion,businessConfig) && !configuredOnly) {
       lockConversationFlowLanguage(sessionId,informationLanguage,'booking_support');
       nonMutatingSupportTurns[sessionId]=Date.now();
       businessInformationTurns[sessionId]={savedAt:Date.now(),businessConfig,question:informationQuestion,language:informationLanguage,retrievedKnowledge:''};
       if (!nativeAsync.failed && nativeAsync.admission?.result.mayAttach && nativeAsync.runtime) {
         try {
           const intake=nativeIntakeScope.getStore();if(intake)intake.handoffAttempted=true;
+          const interpretation=brainV2.interpretationCarriage?semanticInterpretation(informationQuestion):undefined;
           await nativeAsync.runtime.attach(nativeAsync.admission,{question:informationQuestion,language:informationLanguage,
-            history:(knowledgeState?.history || []).filter(h=>['user','assistant'].includes(h.role))});
+            history:(knowledgeState?.history || []).filter(h=>['user','assistant'].includes(h.role)),...(interpretation?{interpretation}:{})});
         } catch {
           runOptionalDiagnostic(()=>console.error('[AsyncKnowledge]',{stage:'attachment_outcome_unknown'}));
           if(nativeIntakeScope.getStore())throw new Error('knowledge_intake_attachment_uncertain');
@@ -19317,6 +19568,13 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
     activeLanguage: normalizationActiveLanguage as any, timezone: String(businessConfig?.timezone || "Europe/Stockholm"),
     ...(params.now === undefined ? {} : { now: params.now })
   }, structuredUnderstandingShadowOptions);
+  // Sol's structured new-booking intent for this exact text enters the booking flow when deterministic understanding found no booking
+  // intent (e.g. "Könnten Sie mich für Montagvormittag eintragen?"). It never overrides a deterministic booking-family intent, and the
+  // flow below keeps state, availability checks, explicit confirmation and mutation safeguards.
+  const semanticBookingIntent = semanticBookingRequest(text);
+  if (semanticBookingIntent?.intent === "new_booking" && ["general_question", "unknown", "clarification"].includes(normalizedRequest.intent)) {
+    normalizedRequest = { ...normalizedRequest, intent: "new_booking" };
+  }
   let controlledUnderstandingCandidates: ControlledUnderstandingCandidates = Object.freeze({});
   let semanticServicePhrase: string | null = null;
   if (
@@ -20519,6 +20777,7 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
                 serviceResolutionLanguage,
                 configuredServiceNames,
                 deterministicToneConfig,
+                guidanceServices,
               )
             : await renderUnsupportedServiceBookingReply(
                 serviceResolutionLanguage,
@@ -20696,6 +20955,8 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
     }
   }
 
+  // Cancellation time checks follow the turn clock (an injected params.now in tests; wall clock otherwise).
+  const cancellationClockMs = () => params.now ? appointmentTurnNowMs : Date.now();
   const cancellationSubject = (appointment: any): CancellationSubject | null => {
     const owner = appointmentStateOwners[sessionId];
     if (!owner || !appointmentStateOwnerMatches(owner, currentAppointmentStateOwner) ||
@@ -20705,7 +20966,7 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
       (appointment.userId && normalizePlatformUserId(owner.platform, appointment.userId) !== owner.userId)) return null;
     const appointmentId = getAppointmentMutationId(appointment), eventId = getAppointmentCalendarEventId(appointment);
     const start = new Date(String(appointment.start || '')).getTime(), end = new Date(String(appointment.end || '')).getTime();
-    if (!appointmentId || !eventId || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || start <= Date.now()) return null;
+    if (!appointmentId || !eventId || !Number.isFinite(start) || !Number.isFinite(end) || end <= start || start <= cancellationClockMs()) return null;
     return Object.freeze({ appointmentId, eventId, businessId, platform: owner.platform, userId: owner.userId,
       start: new Date(start).toISOString(), end: new Date(end).toISOString(), service: String(appointment.service || ''),
       calendarEtag: appointment.calendarEtag,
@@ -20740,7 +21001,7 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
       if (cancellationContexts[sessionId] !== expectedContext) return false;
       const policy = config && readCancellationPolicy(config);
       const subject = appointment && cancellationSubject(appointment);
-      const fee = policy && subject ? cancellationFee(policy, subject.start) : null;
+      const fee = policy && subject ? cancellationFee(policy, subject.start, cancellationClockMs()) : null;
       const calendarMatches = config && String(config.googleCalendarId || '') ===
         String(getCalendarAdapter(businessConfig).getCalendarId?.() || '').trim();
       if (!policy || !subject || fee === null || !calendarMatches) {
@@ -20907,7 +21168,7 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
     const confirmedSubject = cancellationSubject({ ...appointment, calendarEtag: exactEventBeforeDelete?.etag });
     const confirmedConfig = await loadCurrentCancellationConfig(businessConfig);
     const confirmedPolicy = confirmedConfig && readCancellationPolicy(confirmedConfig);
-    const confirmedFee = confirmedPolicy && confirmedSubject ? cancellationFee(confirmedPolicy, confirmedSubject.start) : null;
+    const confirmedFee = confirmedPolicy && confirmedSubject ? cancellationFee(confirmedPolicy, confirmedSubject.start, cancellationClockMs()) : null;
     if (!confirmedPolicy || !confirmedSubject || confirmedFee === null ||
       String(confirmedConfig.googleCalendarId || '') !== configuredCalendarId) {
       receipt.consumed = true;
@@ -20984,7 +21245,8 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
       }
       return true;
     };
-    if (appointment.source !== 'appointments_table' || !appointment.id || !validCancellationEtag(receipt.subject.calendarEtag)) {
+    if (appointment.source !== 'appointments_table' || !appointment.id || !validCancellationEtag(receipt.subject.calendarEtag) ||
+        fragmentMutationForbidden()) {
       await settleAtomicOperation(operationClaim, 'failed');
       await replyAndRecord(formatCancellationUnverified(context.language), context.language); return true;
     }
@@ -21003,7 +21265,7 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
       finalAppointment = await validatedCancellationAppointment(appointment);
       const finalPolicy = finalConfig && readCancellationPolicy(finalConfig);
       const finalSubject = finalAppointment && cancellationSubject(finalAppointment);
-      const finalFee = finalPolicy && finalSubject ? cancellationFee(finalPolicy, finalSubject.start) : null;
+      const finalFee = finalPolicy && finalSubject ? cancellationFee(finalPolicy, finalSubject.start, cancellationClockMs()) : null;
       const valid = finalPolicy?.allowCancellation && finalSubject && finalFee !== null &&
         String(finalConfig.googleCalendarId || '') === configuredCalendarId &&
         cancellationContexts[sessionId]?.confirmation === receipt && receipt.language === context.language &&
@@ -21595,6 +21857,11 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
       return true;
     }
 
+    if (fragmentMutationForbidden()) {
+      await settleAtomicOperation(operationClaim, "failed");
+      await replyAndRecord(getErrorMessageByLanguage(lockedLanguage));
+      return true;
+    }
     const rescheduleSlotReservation = await claimDurableSlotReservation({
       businessId: currentBookingSlotOwner.businessId,
       calendarIdentity: getCalendarReservationIdentity(adapter, businessConfig),
@@ -24079,6 +24346,7 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
                   getFlowReplyLanguage(pending.language, language, text),
                   configuredServiceNames,
                   deterministicToneConfig,
+                  guidanceServices,
                 )
         );
         return true;
@@ -25799,7 +26067,7 @@ async function handleUnifiedBookingEngineTurn(params: UnifiedBookingEngineParams
           pending.availabilityConstraint
         )
       );
-      if (!ownedTargetMatches) {
+      if (!ownedTargetMatches || fragmentMutationForbidden()) {
         console.error("[BookingFlow]", {
           platform: platformName,
           businessScopePresent: Boolean(currentBookingSlotOwner.businessId),
@@ -37927,6 +38195,20 @@ export const priority1hUnifiedEngineTestBoundary = {
     };
   },
 
+  inspectSemanticKnowledgeAdmissionForTest(channel:KnowledgeTurnState['nativeChannel'],text:string,config:any,decision:RouteDecision|null) {
+    if(process.env.NODE_ENV!=='test')throw new Error('Test-only');
+    const t=normalizeConversationText(text);
+    return decision ? semanticRouteScope.run({text:t,decision},()=>verifiedKnowledgeInformationRequest(t,config,channel)) : verifiedKnowledgeInformationRequest(text,config,channel);
+  },
+  inspectDurableHandoffEligibilityForTest(text:string,config:any,decision:RouteDecision|null) {
+    if(process.env.NODE_ENV!=='test')throw new Error('Test-only');
+    const t=normalizeConversationText(text);
+    return decision ? semanticRouteScope.run({text:t,decision},()=>semanticEvidenceFirstEligible(t,config)) : semanticEvidenceFirstEligible(t,config);
+  },
+  configuredPolicyQuestionForTest(text:string,config:any) {
+    if(process.env.NODE_ENV!=='test')throw new Error('Test-only');
+    return configuredPolicyQuestion(text,config);
+  },
   inspectNativeKnowledgeAdmissionForTest(channel:KnowledgeTurnState['nativeChannel'],text:string,config:any) {
     if(process.env.NODE_ENV!=='test')throw new Error('Test-only');
     return verifiedKnowledgeInformationRequest(text,config,channel);
@@ -38123,10 +38405,13 @@ export const priority1hUnifiedEngineTestBoundary = {
     const id = String(getBusinessIdFromConfig(config));
     cancellationPolicyEpochs.set(id, (cancellationPolicyEpochs.get(id) || 0) + 1);
   },
-  async turn(params: Omit<Parameters<typeof handleUnifiedBookingEngine>[0], "send" | "history" | "postProcessPlatform" | "platformLogName"> & { sendResult?: boolean; sendThrows?: boolean }) {
+  async turn(params: Omit<Parameters<typeof handleUnifiedBookingEngine>[0], "send" | "history" | "postProcessPlatform" | "platformLogName"> & { sendResult?: boolean; sendThrows?: boolean;
+    /** Test-only: the authenticated inbound provider event of this turn (canonical spend identity for accounted routing). */
+    inboundEvent?: { account: string; eventId: string } }) {
     if (process.env.NODE_ENV !== "test") throw new Error("Priority 1H test boundary is test-only");
     const replies: string[] = [];
-    const handled = await handleUnifiedBookingEngine({
+    const inScope = <T>(work: () => Promise<T>) => params.inboundEvent ? testInboundEventScope.run(params.inboundEvent, work) : work();
+    const handled = await inScope(() => handleUnifiedBookingEngine({
       ...params, customerMessageAt: params.customerMessageAt === undefined ? new Date(Date.now() + 1).toISOString() : params.customerMessageAt,
       history: chatSessions[params.sessionId] || [],
       platformLogName: params.platformName,
@@ -38136,9 +38421,10 @@ export const priority1hUnifiedEngineTestBoundary = {
         if (params.sendResult === false) return false;
         replies.push(reply); return true;
       },
-    });
+    }));
     return {
       handled: handled.kind === 'handled',
+      kind: handled.kind,
       replies,
       pending: pendingBookings[params.sessionId] ? structuredClone(pendingBookings[params.sessionId]) : null,
       operation: resolveAuthoritativeOperation({

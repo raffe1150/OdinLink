@@ -9,6 +9,9 @@ export type KnowledgeScope = Readonly<{
 export type KnowledgeInput = Readonly<{
   question: string; language: string;
   history: readonly Readonly<{ role: 'user' | 'assistant'; content: string }>[];
+  /** Optional Sol Understanding V2 restatement (references resolved). Carried only when the database input allowlist accepts it
+   * (ODINLINK_KNOWLEDGE_INTERPRETATION_CARRIAGE); never replaces the customer's words in `question`. */
+  interpretation?: string;
 }>;
 export type ProcessingState = 'ACCEPTED' | 'RUNNING' | 'VERIFIED' | 'FINALIZED' | 'FAILED' | 'EXPIRED' | 'SUPERSEDED';
 export type DeliveryState = 'PENDING' | 'SENDING' | 'SENT' | 'FAILED' | 'EXPIRED' | 'SUPERSEDED' | 'UNCERTAIN';
@@ -120,10 +123,11 @@ export function captureInput(input: KnowledgeInput): KnowledgeInput {
   if (!/^[a-z]{2,3}(?:-[A-Za-z]{2,8})?$/u.test(input.language) || !Array.isArray(input.history) || input.history.length > 4)
     throw new Error('knowledge_invalid_input');
   // Reconstruct only allowlisted fields. No config, credentials or arbitrary metadata.
+  if (input.interpretation !== undefined) text(input.interpretation, 600);
   return snapshot({ question: input.question, language: input.language, history: input.history.map(h => {
     if (!['user', 'assistant'].includes(h.role)) throw new Error('knowledge_invalid_history');
     text(h.content, 1200); return { role: h.role, content: h.content };
-  }) });
+  }), ...(input.interpretation !== undefined ? { interpretation: input.interpretation } : {}) });
 }
 export function captureVerified(result: VerifiedKnowledge): VerifiedKnowledge {
   if (result.protocol === 'safe-unavailable-v1') {

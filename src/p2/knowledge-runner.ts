@@ -12,6 +12,9 @@ import { boundedInteger, captureVerified, safeUnavailableKnowledge, resultDigest
  */
 export type KnowledgeExecutor = (task: KnowledgeTask, context: Readonly<{
   signal: AbortSignal; expiresAt: number;
+  /** The worker's real compute deadline (knowledgeExecutionDeadline): `signal` aborts at it. Executors size their stages from this, never
+   * from `expiresAt` (which still includes the finalization and delivery reserve). */
+  deadlineAt?: number;
   progress?(stage: 'extraction' | 'verification' | null, labels?: readonly string[]): void;
   ownsLease?(): Promise<boolean>;
   reserveModelAttempt(): Promise<void>;
@@ -107,7 +110,7 @@ export class KnowledgeRunner {
           let result: VerifiedKnowledge | null;
           try {
             result = claimed.publicationV2 && (claimed.finalOnly || priorAttempt || Date.now() >= deadlineAt) ? fallback()
-              : await knowledgeOperation(executionSignal=>this.execute(claimed, { signal: executionSignal, expiresAt: claimed.expiresAt,
+              : await knowledgeOperation(executionSignal=>this.execute(claimed, { signal: executionSignal, expiresAt: claimed.expiresAt, deadlineAt,
                 ownsLease: async () => {
                   if (executionSignal.aborted) return false;
                   if (this.repository.ownsLease) {

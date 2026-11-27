@@ -77,6 +77,43 @@ function withinSignal<T>(pending: Promise<T>, signal: AbortSignal): Promise<T> {
  * in server.ts. A type/approval label is not proof of an owner's durability.
  * Installing a real owner requires separate operational review and limits.
  */
+/** Aggregate per-message spending invariant (Sol Understanding V2).
+ * The deployed authority enforces the per-turn ceiling on the counter bucket ('turn', business, requestKey) with
+ * least(operator turn cap, PLAN turn cap, quote limit), atomically, and unique(account, business, request_key, stage).
+ * While routing is accounted, EVERY paid phase of one inbound message — Sol understanding, the Reference Engine, the foreground or
+ * durable legacy engine, Tier B — reserves under ONE canonical, authenticated inbound identity (inboundMessageSpendKey). The database
+ * then sums them in a single bucket under the effective (plan-aware) ceiling, and stage uniqueness makes Reference and legacy
+ * mutually exclusive for the message (the second reservation of a stage is refused before dispatch). No application carve-out from
+ * the operator ceiling is involved. routingRequestCapNanoUsd is only the per-request routing bound (the SQL row denies above it). */
+let routingRequestCapNanoUsd = 0;
+export function configureRoutingTurnAllowance(nanoUsd: number): void {
+  check(integer(nanoUsd), 'routing_allowance');
+  routingRequestCapNanoUsd = nanoUsd;
+}
+export function routingTurnAllowance(): number { return routingRequestCapNanoUsd; }
+/** The ONE tenant whose paid phases use the canonical inbound message identity. Bound to the DATABASE fact (the routing money stage
+ * attestation) and the pilot tenant, NOT to the routing mode or the Reference flag, so an already admitted or partially processed message
+ * keeps the same bucket when feature flags are disabled, across restarts and during durable recovery. null = baseline keys everywhere. */
+let canonicalSpendTenant: number | null = null;
+export function configureCanonicalMessageSpend(tenant: number | null): void {
+  check(tenant === null || (integer(tenant) && tenant > 0), 'canonical_spend_tenant');
+  canonicalSpendTenant = tenant;
+}
+/** True when this tenant's paid phases must use the canonical inbound message identity (stable across flag changes, see above). */
+export function canonicalMessageSpendActive(businessId: number): boolean { return canonicalSpendTenant !== null && businessId === canonicalSpendTenant; }
+/** requestKey of one paid Knowledge phase: the canonical inbound identity for the canonical tenant when the authenticated event is
+ * known, otherwise the caller's baseline key (unchanged). Pure: the same message always maps to the same key under the same database fact. */
+export function knowledgeMessageRequestKey(i: Readonly<{ businessId: number; spend: Readonly<{ channel: string; account: string; eventId: string }> | null;
+  baselineKey: string }>): string {
+  return Number.isSafeInteger(i.businessId) && canonicalMessageSpendActive(i.businessId) && i.spend
+    ? inboundMessageSpendKey({ businessId: i.businessId, ...i.spend }) : i.baselineKey;
+}
+/** Canonical spend identity of one authenticated inbound provider event (deterministic across duplicates, recovery and restarts). */
+export function inboundMessageSpendKey(i: Readonly<{ businessId: number; channel: string; account: string; eventId: string }>): string {
+  check(Number.isSafeInteger(i.businessId) && i.businessId > 0 && /^(telegram|whatsapp|instagram|messenger)$/u.test(i.channel) &&
+    typeof i.account === 'string' && i.account.length > 0 && typeof i.eventId === 'string' && i.eventId.length > 0, 'message_identity');
+  return digest(JSON.stringify(['odinlink-inbound-message-v1', i.businessId, i.channel, i.account, i.eventId]));
+}
 export function configureKnowledgeBudgetOwner(owner?: KnowledgeBudgetOwner): void {
   if (!owner) { installedOwner = undefined; return; }
   check(owner.id.trim() && owner.approvalReference.trim() && owner.accounting === 'atomic-durable', 'owner_identity');
@@ -92,6 +129,29 @@ export function configureKnowledgeBudgetOwner(owner?: KnowledgeBudgetOwner): voi
     ...(owner.naturalTransition ? { naturalTransition: owner.naturalTransition.bind(owner) } : {}) });
 }
 /** Read-only view of the installed durable owner for the Tier B budget adapter (never an experiment ledger). */
+/** Narrow money authority for the Reference Knowledge adapter (src/p2/reference-knowledge-executor.ts). Exposes ONLY the installed
+ * durable owner's reserve / settle / retainUnknown and its identity and limits, and only for a tenant the owner covers. The database
+ * (odin_ai_money_v1) still validates every quote atomically. No owner installed or tenant not covered → undefined. */
+export function knowledgeReferenceMoneyAuthority(businessId: number): Readonly<Pick<KnowledgeBudgetOwner, 'id' | 'approvalReference' |
+  'providerProjectId' | 'businessIds' | 'maximumRequestNanoUsd' | 'maximumTurnNanoUsd' | 'reserve' | 'settle' | 'retainUnknown'>> | undefined {
+  const owner = installedOwner;
+  if (!owner || !Number.isSafeInteger(businessId) || !owner.businessIds.includes(businessId)) return undefined;
+  return Object.freeze({ id: owner.id, approvalReference: owner.approvalReference, ...(owner.providerProjectId ? { providerProjectId: owner.providerProjectId } : {}),
+    businessIds: Object.freeze([businessId]), maximumRequestNanoUsd: owner.maximumRequestNanoUsd, maximumTurnNanoUsd: owner.maximumTurnNanoUsd,
+    reserve: owner.reserve, settle: owner.settle, retainUnknown: owner.retainUnknown });
+}
+/** Routing money authority (Sol Understanding V2, stage 'routing'): the SAME installed durable owner's generic transition, limited to the
+ * routing allowance. Undefined when routing is not accounted, no owner is installed, the tenant is not covered, or the owner has no
+ * generic transition. The database re-checks every quote (stage, model, rates, envelope, routing allowance, all caps) atomically. */
+export function knowledgeRoutingMoneyAuthority(businessId: number): Readonly<{ id: string; approvalReference: string; providerProjectId?: string;
+  maximumRequestNanoUsd: number; maximumTurnNanoUsd: number;
+  transition(command: 'reserve' | 'settle' | 'unknown', payload: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> }> | undefined {
+  const owner = installedOwner, cap = routingRequestCapNanoUsd;
+  if (!owner || !cap || !owner.naturalTransition || !Number.isSafeInteger(businessId) || !owner.businessIds.includes(businessId)) return undefined;
+  // The turn limit is the owner's (the database applies the plan-aware effective ceiling to the shared per-message bucket).
+  return Object.freeze({ id: owner.id, approvalReference: owner.approvalReference, ...(owner.providerProjectId ? { providerProjectId: owner.providerProjectId } : {}),
+    maximumRequestNanoUsd: Math.min(owner.maximumRequestNanoUsd, cap), maximumTurnNanoUsd: owner.maximumTurnNanoUsd, transition: owner.naturalTransition });
+}
 export function installedKnowledgeBudgetOwner(): Readonly<Pick<KnowledgeBudgetOwner, 'id' | 'approvalReference' | 'accounting' | 'providerProjectId' |
   'businessIds' | 'maximumRequestNanoUsd' | 'maximumTurnNanoUsd' | 'naturalTransition'>> | undefined {
   return installedOwner;

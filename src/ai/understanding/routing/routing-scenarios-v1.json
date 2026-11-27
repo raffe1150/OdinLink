@@ -1,0 +1,480 @@
+{
+ "source": "knowledge-reference eval dataset-v1 (routing fields only)",
+ "sourceSha256": "c93d3a32454623f0fd3fc298fd014d7a79c0df87865c42d404ca92da48685219",
+ "cases": [
+  {
+   "id": "sv-01",
+   "language": "sv",
+   "question": "Jag ska besöka AdMotion Studio för första gången. Hur tidigt bör jag komma, hur hittar jag till entrén och är det ett krav att komma tidigare?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "sv-02",
+   "language": "sv",
+   "question": "Hur tidigt ska jag vara på plats inför mitt första besök?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "sv-03",
+   "language": "sv",
+   "question": "Måste jag komma tio minuter innan min tid?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "sv-04",
+   "language": "sv",
+   "question": "Hur hittar jag ingången till studion?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "sv-05",
+   "language": "sv",
+   "question": "Var kan jag parkera bilen, och får jag ställa cykeln utanför?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "sv-06",
+   "language": "sv",
+   "question": "Kan jag reservera en plats där?",
+   "expectedRoute": "knowledge",
+   "history": [
+    {
+     "role": "user",
+     "content": "Finns det parkering nära er?"
+    },
+    {
+     "role": "assistant",
+     "content": "Det finns ett parkeringsgarage som heter Nordpark, med infart på Stjärngatan 14."
+    }
+   ]
+  },
+  {
+   "id": "sv-07",
+   "language": "sv",
+   "question": "Vad kostar en behandling hos er?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "sv-08",
+   "language": "sv",
+   "question": "Vilka öppettider har ni, och vad händer om jag blir 20 minuter sen?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "sv-09",
+   "language": "sv",
+   "question": "Kan jag boka en tid på tisdag klockan 14?",
+   "expectedRoute": "booking",
+   "history": []
+  },
+  {
+   "id": "sv-10",
+   "language": "sv",
+   "question": "Vad har ni för adress?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "en-01",
+   "language": "en",
+   "question": "I'm visiting AdMotion Studio for the first time. How early should I arrive, how do I find the entrance, and is it required to come early?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "en-02",
+   "language": "en",
+   "question": "How early should I arrive?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "en-03",
+   "language": "en",
+   "question": "Is it mandatory to be there 10 minutes before my appointment?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "en-04",
+   "language": "en",
+   "question": "Where exactly is the entrance? I don't want to go to the wrong door.",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "en-05",
+   "language": "en",
+   "question": "Is there somewhere to park my car, and can I bring my bike?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "en-06",
+   "language": "en",
+   "question": "Can she come into the treatment room with me too?",
+   "expectedRoute": "knowledge",
+   "history": [
+    {
+     "role": "user",
+     "content": "Can I bring my sister along to my appointment?"
+    },
+    {
+     "role": "assistant",
+     "content": "Yes, you can bring one adult companion to the reception waiting room."
+    }
+   ]
+  },
+  {
+   "id": "en-07",
+   "language": "en",
+   "question": "What are your opening hours?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "en-08",
+   "language": "en",
+   "question": "Can I bring my partner, and how much does a visit cost?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "en-09",
+   "language": "en",
+   "question": "I'd like to book an appointment for next Friday afternoon.",
+   "expectedRoute": "booking",
+   "history": []
+  },
+  {
+   "id": "en-10",
+   "language": "en",
+   "question": "If I'm running 20 minutes late, will my appointment be cancelled?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "de-01",
+   "language": "de",
+   "question": "Ich besuche AdMotion Studio zum ersten Mal. Wie früh sollte ich kommen, wie finde ich den Eingang und ist es Pflicht, früher zu kommen?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "de-02",
+   "language": "de",
+   "question": "Wie früh sollte ich beim ersten Termin da sein?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "de-03",
+   "language": "de",
+   "question": "Muss ich wirklich zehn Minuten vorher da sein?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "de-04",
+   "language": "de",
+   "question": "Wie finde ich den Eingang zum Studio?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "de-05",
+   "language": "de",
+   "question": "Gibt es Parkmöglichkeiten für das Auto, und wo kann ich mein Fahrrad abstellen?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "de-06",
+   "language": "de",
+   "question": "Wird mein Termin dann automatisch storniert?",
+   "expectedRoute": "knowledge",
+   "history": [
+    {
+     "role": "user",
+     "content": "Ich komme heute vielleicht 20 Minuten zu spät."
+    },
+    {
+     "role": "assistant",
+     "content": "Bitte kontaktieren Sie das Studio so bald wie möglich über den Kanal, über den Sie normalerweise mit dem Studio kommunizieren."
+    }
+   ]
+  },
+  {
+   "id": "de-07",
+   "language": "de",
+   "question": "Welche Zahlungsmethoden akzeptieren Sie?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "de-08",
+   "language": "de",
+   "question": "Darf ich eine eigene Wasserflasche mitbringen, und wie lange dauert eine Behandlung?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "de-09",
+   "language": "de",
+   "question": "Ich möchte meinen Termin am Donnerstag auf nächste Woche verschieben.",
+   "expectedRoute": "booking",
+   "history": []
+  },
+  {
+   "id": "de-10",
+   "language": "de",
+   "question": "Darf ich im Wartebereich etwas essen?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "es-01",
+   "language": "es",
+   "question": "Voy a visitar AdMotion Studio por primera vez. ¿Con cuánta antelación debo llegar, cómo encuentro la entrada y es obligatorio llegar antes?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "es-02",
+   "language": "es",
+   "question": "¿Con cuánto tiempo de antelación debo llegar a mi primera cita?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "es-03",
+   "language": "es",
+   "question": "¿Tengo que llegar sí o sí diez minutos antes?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "es-04",
+   "language": "es",
+   "question": "¿Cómo llego a la entrada del estudio?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "es-05",
+   "language": "es",
+   "question": "¿Hay aparcamiento cerca? ¿Es gratis?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "es-06",
+   "language": "es",
+   "question": "¿Me las pueden enviar por correo?",
+   "expectedRoute": "knowledge",
+   "history": [
+    {
+     "role": "user",
+     "content": "Creo que me dejé las gafas en el estudio."
+    },
+    {
+     "role": "assistant",
+     "content": "Los objetos encontrados en el estudio se entregan en la recepción y normalmente se guardan hasta 21 días."
+    }
+   ]
+  },
+  {
+   "id": "es-07",
+   "language": "es",
+   "question": "¿Cuánto dura una sesión?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "es-08",
+   "language": "es",
+   "question": "¿Puedo dejar mi bicicleta allí y qué formas de pago aceptan?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "es-09",
+   "language": "es",
+   "question": "Quiero reservar una cita para mañana por la tarde.",
+   "expectedRoute": "booking",
+   "history": []
+  },
+  {
+   "id": "es-10",
+   "language": "es",
+   "question": "Voy en silla de ruedas. ¿El edificio es accesible?",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "fa-01",
+   "language": "fa",
+   "question": "برای اولین بار به استودیو AdMotion می‌آیم. چقدر زودتر باید برسم، ورودی را چطور پیدا کنم و آیا زودتر آمدن الزامی است؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "fa-02",
+   "language": "fa",
+   "question": "چند دقیقه قبل از وقت رزرو باید اونجا باشم؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "fa-03",
+   "language": "fa",
+   "question": "آیا حتماً باید ده دقیقه زودتر بیایم؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "fa-04",
+   "language": "fa",
+   "question": "ورودی استودیو کجاست؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "fa-05",
+   "language": "fa",
+   "question": "با ماشین می‌آیم؛ کجا پارک کنم و پارکینگ رایگان است؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "fa-06",
+   "language": "fa",
+   "question": "آسانسور هم دارد؟",
+   "expectedRoute": "knowledge",
+   "history": [
+    {
+     "role": "user",
+     "content": "ورودی استودیو کجاست؟"
+    },
+    {
+     "role": "assistant",
+     "content": "ورودی استودیو در حیاط داخلی است، نه در ورودی اصلی رو به خیابان."
+    }
+   ]
+  },
+  {
+   "id": "fa-07",
+   "language": "fa",
+   "question": "هزینه هر جلسه چقدر است؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "fa-08",
+   "language": "fa",
+   "question": "من برای اولین بار می‌خوام بیام. چند دقیقه قبل از وقت رزرو باید اونجا باشم و آیا لازم هست چیزی با خودم بیارم؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "fa-09",
+   "language": "fa",
+   "question": "می‌خواهم برای پنجشنبه ساعت ۱۰ صبح وقت رزرو کنم.",
+   "expectedRoute": "booking",
+   "history": []
+  },
+  {
+   "id": "fa-10",
+   "language": "fa",
+   "question": "آیا می‌توانم به جای مراجعه حضوری، یک جلسه آنلاین داشته باشم؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "ar-01",
+   "language": "ar",
+   "question": "سأزور استوديو AdMotion لأول مرة. كم يجب أن أصل مبكرًا، وكيف أجد المدخل، وهل الوصول المبكر إلزامي؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "ar-02",
+   "language": "ar",
+   "question": "متى يجب أن أصل قبل موعدي الأول؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "ar-03",
+   "language": "ar",
+   "question": "هل يجب علي الحضور قبل عشر دقائق من الموعد؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "ar-04",
+   "language": "ar",
+   "question": "كيف أصل إلى مدخل الاستوديو؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "ar-05",
+   "language": "ar",
+   "question": "هل يمكنني ركن سيارتي قريبًا، وهل يمكن حجز مكان مسبقًا؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "ar-06",
+   "language": "ar",
+   "question": "وكم يستغرق المشي من هناك إلى الاستوديو؟",
+   "expectedRoute": "knowledge",
+   "history": [
+    {
+     "role": "user",
+     "content": "هل يوجد موقف سيارات قريب؟"
+    },
+    {
+     "role": "assistant",
+     "content": "نعم، يوجد مرآب سيارات يُسمى Nordpark ومدخله في Stjärngatan 14."
+    }
+   ]
+  },
+  {
+   "id": "ar-07",
+   "language": "ar",
+   "question": "هل توفرون خدمة الواي فاي للزوار؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "ar-08",
+   "language": "ar",
+   "question": "هل يمكنني ترك ابني البالغ من العمر ثماني سنوات في الاستقبال، وما هي أسعاركم؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  },
+  {
+   "id": "ar-09",
+   "language": "ar",
+   "question": "أريد حجز موعد يوم الأحد القادم.",
+   "expectedRoute": "booking",
+   "history": []
+  },
+  {
+   "id": "ar-10",
+   "language": "ar",
+   "question": "هل يمكنني وضع العطر قبل الموعد؟",
+   "expectedRoute": "knowledge",
+   "history": []
+  }
+ ]
+}

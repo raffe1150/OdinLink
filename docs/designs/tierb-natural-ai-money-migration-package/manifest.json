@@ -9,5 +9,7 @@
   "newBodyMd5": "cf7773b3a165f6118f91cede0f265b45",
   "newBodySha256": "92181adfb0026f0aed847247d7e191c16d8887e104e05ab5c3c40012cfdd007c",
   "applied": false,
-  "automaticMigrationDiscovery": false
+  "automaticMigrationDiscovery": false,
+  "deployedInProduction": true,
+  "deployedEvidence": "Owner read-only production export 2026-11-26: deployed transition_core_v2 body equals this forward body byte for byte (md5 cf7773b3a165f6118f91cede0f265b45). See brain-v2/routing-money-deployed-contract-verification-20261126.md."
 }

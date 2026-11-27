@@ -1,0 +1,37 @@
+{
+  "function": "ai_money.transition_core_v2(text,text,text,jsonb,jsonb)",
+  "stage": "routing",
+  "model": "gpt-5.6-luna",
+  "ratesVersion": "openai-luna-standard-2026-07-30",
+  "outputTokenLimit": 1024,
+  "applied": false,
+  "automaticMigrationDiscovery": false,
+  "deployedContractVerified": false,
+  "variants": {
+    "reextraction": {
+      "payload": "routing-stage-v1.base-reextraction.sql",
+      "payloadSha256": "37eaa46ed84f0eaabd6fd8fe96c7316327352abcfda8f6b62c82d178a25ff2c3",
+      "rollback": "rollback-routing-stage-v1.base-reextraction.sql",
+      "rollbackSha256": "89e3838a9e4241d5c8862fd2b3809f6bbbe627ef69b6446eaac568789537b836",
+      "baseSource": "supabase/migrations/20261112123601_knowledge_re_extraction_stage.sql",
+      "expectedCurrentBodyMd5": "e54c7052fd6ad27b10983d7d78cda9b4",
+      "expectedCurrentBodySha256": "c66d00af7588fb25ca138ef4fd8b8a1a51bb5271b11eb7d7dff9c476fd9cc098",
+      "newBodyMd5": "718719b17d6e096348d631896bf0cc66",
+      "newBodySha256": "e60a399b36c34885955f7d59617c494ad477aa0625ba62622a47bf46f46646ce"
+    },
+    "tierb": {
+      "payload": "routing-stage-v1.base-tierb.sql",
+      "payloadSha256": "5e0f21b66df87ff64d9ad80e660d9485a06110526afa2a3a33f130456562d88a",
+      "rollback": "rollback-routing-stage-v1.base-tierb.sql",
+      "rollbackSha256": "a60fd60170e9e7b30a4ba6ff45f3bd8c10467e91279ab473ce6e6f90eeb68b28",
+      "baseSource": "docs/designs/tierb-natural-ai-money-migration-package/tierb-natural-stages-v1.sql",
+      "expectedCurrentBodyMd5": "cf7773b3a165f6118f91cede0f265b45",
+      "expectedCurrentBodySha256": "92181adfb0026f0aed847247d7e191c16d8887e104e05ab5c3c40012cfdd007c",
+      "newBodyMd5": "e2f1f6a5b74115fec50a9ee3bd22abab",
+      "newBodySha256": "ec3fcfe695614d3893cf17d4bbf744a3b06c2779aa30d98f625e270ef5928473"
+    }
+  },
+  "superseded": true,
+  "supersededBy": "docs/designs/sol-understanding-ai-money-migration-package",
+  "note": "Luna routing stage: never applied; superseded by the Sol Understanding V2 stage (2026-11-26). Do not apply."
+}
